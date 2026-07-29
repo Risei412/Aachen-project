@@ -13,10 +13,16 @@ Hardware setup (one-time, per PC):
                         Interfaces/SDK/Python Toolkit/thorlabs_tsi_sdk-*.whl"
        (see camera-quick-start-guide-eng.pdf in this folder for the exact
        path shipped with your camera model).
-    3. Copy the native DLLs from
-       "...Scientific Camera Interfaces/SDK/Native Toolkit/dlls/Native_64_lib"
-       next to this file, or add that folder to PATH, so
-       ``TLCameraSDK`` can load them.
+    3. Point ``dll_dir`` (constructor arg / ``camera.dll_dir`` in
+       config.yaml) at the folder containing the native DLLs, e.g.
+       "...Scientific Camera Interfaces/SDK/Native Toolkit/dlls/Native_64_lib".
+       Installing the pip package alone is *not* enough: importing
+       ``thorlabs_tsi_sdk`` only pulls in the Python wrapper, and it will
+       fail with "Could not find module 'thorlabs_tsi_camera_sdk.dll'"
+       unless that native DLL folder is explicitly added, because Python
+       3.8+ no longer searches plain ``PATH`` entries for DLL dependencies
+       (see ``_add_dll_directory`` below). Match the DLL bitness (32/64-bit)
+       to your Python interpreter's.
 
 If ``thorlabs_tsi_sdk`` is not importable (e.g. developing away from the
 lab PC), :class:`MockThorlabsCamera` below can be used as a drop-in
@@ -24,13 +30,38 @@ replacement -- see ``ODMR/odmr_app.py`` for how it is selected.
 """
 from __future__ import annotations
 
+import os
+
 import numpy as np
+
+
+def _add_dll_directory(dll_dir: str) -> None:
+    """Make the Thorlabs native DLLs discoverable by the loader.
+
+    Since Python 3.8, DLL dependency search no longer honours ``PATH`` by
+    default (a Windows security hardening change) -- ``os.add_dll_directory``
+    must be called explicitly, which is why the SDK's own DLL folder has to
+    be passed in here rather than just relying on the user's system PATH.
+    """
+    if not os.path.isdir(dll_dir):
+        raise FileNotFoundError(
+            f"Thorlabs DLL directory not found: {dll_dir!r}. Set camera.dll_dir "
+            "in config.yaml to the 'Native Toolkit/dlls/Native_64_lib' (or "
+            "Native_32_lib, matching your Python interpreter's bitness) folder "
+            "from the ThorCam SDK installation."
+        )
+    if hasattr(os, "add_dll_directory"):  # Windows, Python >= 3.8
+        os.add_dll_directory(dll_dir)
+    os.environ["PATH"] = dll_dir + os.pathsep + os.environ.get("PATH", "")
 
 
 class ThorlabsCamera:
     """Live-view wrapper for a single Thorlabs TSI camera."""
 
-    def __init__(self, exposure_ms: float = 20.0, roi=None):
+    def __init__(self, exposure_ms: float = 20.0, roi=None, dll_dir: str | None = None):
+        if dll_dir:
+            _add_dll_directory(dll_dir)
+
         from thorlabs_tsi_sdk.tl_camera import TLCameraSDK  # imported lazily
 
         self._sdk = TLCameraSDK()

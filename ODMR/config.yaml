@@ -8,6 +8,12 @@ camera:
   exposure_ms: 20.0    # camera exposure time per frame, in milliseconds
   binning: 2           # average NxN pixel blocks; shrinks the datacube by N^2
                        # and improves per-pixel SNR. Use 1 for full resolution.
+  dll_dir: "C:/Program Files/Thorlabs/Scientific Imaging/Scientific Camera Support/Scientific Camera Interfaces/SDK/Native Toolkit/dlls/Native_64_lib"
+                       # folder with the Thorlabs native DLLs (thorlabs_tsi_camera_sdk.dll
+                       # and friends). Required for real hardware -- pip installing
+                       # thorlabs_tsi_sdk alone does not make these loadable. Match
+                       # Native_64_lib / Native_32_lib to your Python's bitness.
+                       # Adjust the path to match your ThorCam SDK install location.
 
 microwave:
   port: "COM7"         # Windows: COMx. Linux: /dev/ttyACM0 or /dev/ttyUSB0

@@ -108,7 +108,10 @@ class OdmrApp:
             cam = MockThorlabsCamera(exposure_ms=config["camera"]["exposure_ms"])
             gen._on_state_change = lambda freq, power, rf_on: cam.set_mw_state(freq, power, rf_on)
             return cam, gen
-        cam = ThorlabsCamera(exposure_ms=config["camera"]["exposure_ms"])
+        cam = ThorlabsCamera(
+            exposure_ms=config["camera"]["exposure_ms"],
+            dll_dir=config["camera"].get("dll_dir"),
+        )
         gen = SynthHD(port=config["microwave"]["port"], channel=config["microwave"]["channel"])
         return cam, gen
 

@@ -133,8 +133,16 @@ python odmr_app.py
    ```
    pip install "C:/Program Files/Thorlabs/Scientific Imaging/Scientific Camera Support/Scientific Camera Interfaces/SDK/Python Toolkit/thorlabs_tsi_sdk-*.whl"
    ```
-3. Make sure the native DLLs from `.../SDK/Native Toolkit/dlls/Native_64_lib`
-   are on `PATH` (or copied next to `thorlabs_camera.py`).
+3. Set `camera.dll_dir` in `config.yaml` to the folder with the native DLLs,
+   e.g. `.../SDK/Native Toolkit/dlls/Native_64_lib`. This step is easy to
+   miss: `pip install`ing `thorlabs_tsi_sdk` only gets you the Python
+   wrapper, and importing it fails with
+   `Could not find module 'thorlabs_tsi_camera_sdk.dll'` unless this
+   folder is explicitly registered — Python 3.8+ no longer searches plain
+   `PATH` entries for a module's native dependencies, so just adding the
+   folder to your system PATH is not enough on its own (the app calls
+   `os.add_dll_directory()` for you once `dll_dir` is set). Match
+   `Native_64_lib` / `Native_32_lib` to your Python interpreter's bitness.
 4. **Close ThorCam itself** before running this app — the SDK cannot share
    the camera with the ThorCam GUI.
 5. See `Equipments/CMOS camera/camera-quick-start-guide-eng.pdf` for your
