@@ -25,6 +25,10 @@ microwave:
   port: "COM7"         # Windows: COMx. Linux: /dev/ttyACM0 or /dev/ttyUSB0
   channel: 0           # 0 = channel A, 1 = channel B
   power_dbm: 0.0        # RF power sent to the MW antenna/loop near the sample
+  freq_limits_mhz: [54.0, 13600.0]   # generator's tuning range, used to reject
+                        # out-of-range sweep entries typed into the GUI.
+                        # SynthHD is 54 MHz - 13.6 GHz; SynthHD PRO is 10 MHz - 15 GHz.
+                        # Check your unit and adjust.
 
 sweep:
   start_mhz: 2800.0     # start frequency of the ODMR sweep

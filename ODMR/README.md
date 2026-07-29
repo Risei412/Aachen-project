@@ -40,23 +40,33 @@ and you can probe as many points as you like from one measurement.
    contrast at all, no matter how good the rest of the setup is. Exposure is
    locked during a sweep, since changing it mid-sweep would make the
    datacube's frequency points incomparable.
-2. Press **"MW check"** first (see below) to confirm the NV centers are
-   actually responding, before spending minutes on a full sweep.
-3. Press **"Run sweep"**. Progress is shown as the frequency advances; press
+2. Set the sweep in the **Start / Stop / Step / Repeats** boxes (press Enter
+   to apply each). The line beside them shows what you are committing to
+   before anything runs — number of points, total frames, estimated duration
+   and datacube size — so a range that would take an hour or exhaust memory
+   is visible up front rather than discovered halfway through. Entries are
+   validated against the generator's tuning range
+   (`microwave.freq_limits_mhz`) and rejected with a reason if the stop is
+   below the start, the step is non-positive, or the plan is absurdly large;
+   a rejected box snaps back to its last accepted value. `config.yaml` still
+   supplies the starting values.
+3. Press **"MW check"** (see below) to confirm the NV centers are actually
+   responding, before spending minutes on a full sweep.
+4. Press **"Run sweep"**. Progress is shown as the frequency advances; press
    the same button (now "Abort") to stop early and keep the points measured
-   so far.
-4. When the sweep finishes the image is displayed. **Click anywhere on it**
+   so far. Sweep parameters are locked while it runs.
+5. When the sweep finishes the image is displayed. **Click anywhere on it**
    to plot that spot's ODMR spectrum in the right-hand panel. The status
    line reports the deepest dip frequency and the contrast. Drag the
    **ROI ±px** slider to resize the averaging window; it re-reads the
    datacube already in memory, so exploring ROI sizes after a sweep is
    instant and costs no measurement time.
-5. **"View"** cycles the left panel through the mean photoluminescence
+6. **"View"** cycles the left panel through the mean photoluminescence
    image, the per-pixel ODMR contrast map, and the MW-check difference map
    (whichever are available). The contrast map shows where the microwave
    actually modulates the PL, i.e. where the NV centers are — useful for
    finding the NV layer before picking readout spots.
-6. **"Save"** writes the datacube to `data/odmr_<timestamp>.npz`. Re-open it
+7. **"Save"** writes the datacube to `data/odmr_<timestamp>.npz`. Re-open it
    later with `python odmr_app.py --load data/odmr_....npz` to keep clicking
    around the data with no hardware attached.
 
@@ -225,6 +235,8 @@ Sweep time is roughly
 | `camera.exposure_ms` | Starting exposure; adjust live with the GUI slider. Longer collects more photons (better SNR) but slows the sweep and risks saturation. |
 | `camera.exposure_limits_ms` | Range of the exposure slider. The camera clamps to its own hardware limits anyway. |
 | `roi.half_size_px` | Starting ROI size; adjust live with the slider. Larger averages more pixels — smoother spectrum and tighter error bars (errors add in quadrature) — but blurs spatial detail. |
+| `sweep.start_mhz` / `stop_mhz` / `step_mhz` | Starting sweep range; editable live in the GUI. |
+| `microwave.freq_limits_mhz` | Generator tuning range used to validate GUI entries. SynthHD 54 MHz–13.6 GHz, SynthHD PRO 10 MHz–15 GHz — check your unit. |
 | `sweep.repeats` | Sweeps averaged together. Noise falls as √repeats, time grows linearly. |
 | `sweep.alternate_direction` | Reverses every 2nd repeat so slow drift cancels instead of tilting the lineshape. |
 | `sweep.estimate_errors` | Error bars from between-repeat scatter. Doubles acquisition memory; no effect at `repeats: 1`. |

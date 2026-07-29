@@ -38,7 +38,7 @@ import numpy as np
 import yaml
 from matplotlib import pyplot as plt
 from matplotlib.patches import Rectangle
-from matplotlib.widgets import Button, Slider
+from matplotlib.widgets import Button, Slider, TextBox
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "Equipments", "CMOS camera"))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "Equipments", "Microwave generator"))
@@ -81,6 +81,10 @@ class OdmrApp:
             config.get("analysis", {}).get("min_signal_fraction", 0.15)
         )
         self.diag_cfg = config.get("diagnostic", {}) or {}
+        freq_limits = config["microwave"].get("freq_limits_mhz", [54.0, 13600.0])
+        self.freq_limits_mhz = (float(freq_limits[0]), float(freq_limits[1]))
+        self._updating_params = False
+        self._frame_shape: tuple[int, int] | None = None
         self.exposure_ms = float(config["camera"]["exposure_ms"])
         limits = config["camera"].get("exposure_limits_ms", [0.05, 1000.0])
         self.exposure_limits_ms = (float(limits[0]), float(limits[1]))
@@ -136,7 +140,7 @@ class OdmrApp:
     def _build_figure(self) -> None:
         self.fig, (self.ax_img, self.ax_spec) = plt.subplots(1, 2, figsize=(13, 5.5))
         self.fig.canvas.manager.set_window_title("Widefield ODMR viewer")
-        self.fig.subplots_adjust(bottom=0.24, wspace=0.25)
+        self.fig.subplots_adjust(bottom=0.30, wspace=0.25)
 
         placeholder = np.zeros((10, 10))
         self.im = self.ax_img.imshow(placeholder, cmap="gray", origin="upper")
@@ -159,12 +163,29 @@ class OdmrApp:
         self.btn_save = Button(self.fig.add_axes([0.47, 0.03, 0.10, 0.06]), "Save")
         self.btn_save.on_clicked(self._on_save_clicked)
 
+        # Sweep parameters are editable before the run rather than only via
+        # config.yaml, so the range can be narrowed onto a resonance found by
+        # a previous sweep without restarting the app.
+        self.param_boxes = {}
+        specs = [
+            ("start_mhz", "Start MHz", [0.080, 0.175, 0.070, 0.042]),
+            ("stop_mhz", "Stop", [0.205, 0.175, 0.070, 0.042]),
+            ("step_mhz", "Step", [0.320, 0.175, 0.050, 0.042]),
+            ("repeats", "Repeats", [0.440, 0.175, 0.040, 0.042]),
+        ]
+        for key, label, rect in specs:
+            box = TextBox(self.fig.add_axes(rect), label, initial=self._param_text(key))
+            box.on_submit(lambda text, k=key: self._on_param_submit(k, text))
+            self.param_boxes[key] = box
+
+        self.plan_text = self.fig.text(0.53, 0.196, "", fontsize=8.5, va="center")
+
         # Exposure is set on a logarithmic scale: usable values span three
         # decades (a bright reflection needs tens of microseconds, a dim NV
         # ensemble hundreds of milliseconds), which a linear slider cannot
         # resolve at both ends.
         self.slider_exposure = Slider(
-            self.fig.add_axes([0.09, 0.13, 0.28, 0.025]),
+            self.fig.add_axes([0.09, 0.115, 0.28, 0.022]),
             "Exposure",
             np.log10(self.exposure_limits_ms[0]),
             np.log10(self.exposure_limits_ms[1]),
@@ -176,7 +197,7 @@ class OdmrApp:
         # ROI size is re-applied to the already-measured datacube, so it can
         # be explored freely after the sweep without re-acquiring anything.
         self.slider_roi = Slider(
-            self.fig.add_axes([0.56, 0.13, 0.28, 0.025]),
+            self.fig.add_axes([0.56, 0.115, 0.28, 0.022]),
             "ROI ±px",
             self.roi_half_size_limits[0],
             self.roi_half_size_limits[1],
@@ -186,6 +207,7 @@ class OdmrApp:
         self.slider_roi.on_changed(self._on_roi_size_changed)
 
         self.status = self.fig.text(0.59, 0.06, "", fontsize=8.5, va="center")
+        self._update_plan()
 
         self.fig.canvas.mpl_connect("button_press_event", self._on_click)
         self.fig.canvas.mpl_connect("close_event", self._on_close)
@@ -201,6 +223,109 @@ class OdmrApp:
         self.ax_img.set_xlim(-0.5, image.shape[1] - 0.5)
         self.ax_img.set_ylim(image.shape[0] - 0.5, -0.5)
         self.ax_img.set_title(title)
+        self.fig.canvas.draw_idle()
+
+    # --------------------------------------------------------- sweep parameters
+
+    def _param_text(self, key: str) -> str:
+        value = self.sweep_cfg.get(key, 1)
+        return str(int(value)) if key == "repeats" else f"{float(value):g}"
+
+    def _validate_params(self, start, stop, step, repeats) -> str | None:
+        """Return a human-readable reason the plan is invalid, or None if OK."""
+        low, high = self.freq_limits_mhz
+        if step <= 0:
+            return "Step must be greater than 0."
+        if stop <= start:
+            return "Stop must be greater than Start."
+        if repeats < 1:
+            return "Repeats must be at least 1."
+        if start < low or stop > high:
+            return f"Frequencies must lie within {low:g}-{high:g} MHz (generator range)."
+        if (stop - start) / step > 20000:
+            return "Too many points; increase Step or narrow the range."
+        return None
+
+    def _on_param_submit(self, key: str, text: str) -> None:
+        if self._updating_params:
+            return
+        if self._sweeping:
+            self._revert_param(key)
+            self._set_status("Cannot change sweep parameters while a sweep is running.")
+            return
+
+        try:
+            value = int(float(text)) if key == "repeats" else float(text)
+        except ValueError:
+            self._revert_param(key)
+            self._set_status(f"'{text}' is not a number.")
+            return
+
+        candidate = {
+            "start_mhz": float(self.sweep_cfg["start_mhz"]),
+            "stop_mhz": float(self.sweep_cfg["stop_mhz"]),
+            "step_mhz": float(self.sweep_cfg["step_mhz"]),
+            "repeats": int(self.sweep_cfg.get("repeats", 1)),
+        }
+        candidate[key] = value
+
+        problem = self._validate_params(**{k.replace("_mhz", ""): v for k, v in candidate.items()})
+        if problem:
+            self._revert_param(key)
+            self._set_status(problem)
+            return
+
+        self.sweep_cfg[key] = value
+        # Echo back the canonical form ("2850.0" -> "2850"), so the boxes
+        # always show exactly what the sweep will use.
+        self._revert_param(key)
+        self._update_plan()
+        self._set_status("Sweep plan updated.")
+
+    def _revert_param(self, key: str) -> None:
+        """Restore a text box to the last accepted value without re-triggering."""
+        self._updating_params = True
+        try:
+            self.param_boxes[key].set_val(self._param_text(key))
+        finally:
+            self._updating_params = False
+        self._frame_shape: tuple[int, int] | None = None
+
+    def _update_plan(self) -> None:
+        """Show what the current settings commit to, before the run starts."""
+        start = float(self.sweep_cfg["start_mhz"])
+        stop = float(self.sweep_cfg["stop_mhz"])
+        step = float(self.sweep_cfg["step_mhz"])
+        repeats = int(self.sweep_cfg.get("repeats", 1))
+        n_points = int(round((stop - start) / step)) + 1
+
+        per_frame_ms = self.exposure_ms
+        frames = int(self.sweep_cfg.get("frames_per_point", 1))
+        settle = float(self.sweep_cfg.get("settle_ms", 0.0))
+        seconds = n_points * repeats * (settle + frames * per_frame_ms) / 1000.0
+
+        # Frame shape is cached rather than re-grabbed: this runs on every
+        # keystroke-submit, and pulling a frame from the camera each time
+        # would contend with the live view for the acquisition queue.
+        if self._frame_shape is None and self.camera is not None:
+            try:
+                self._frame_shape = self.camera.get_frame().shape[:2]
+            except Exception:
+                self._frame_shape = None
+
+        megabytes = 0.0
+        if self._frame_shape is not None:
+            megabytes = estimate_cube_bytes(
+                n_points, self._frame_shape[0], self._frame_shape[1], self.binning
+            ) / 1e6
+            if self.sweep_cfg.get("estimate_errors", True) and repeats > 1:
+                megabytes *= 2  # sum-of-squares accumulator runs alongside the sum
+
+        duration = f"{seconds:.0f} s" if seconds < 120 else f"{seconds / 60:.1f} min"
+        text = f"→ {n_points} points × {repeats} = {n_points * repeats} frames, ~{duration}"
+        if megabytes:
+            text += f", ~{megabytes:.0f} MB"
+        self.plan_text.set_text(text)
         self.fig.canvas.draw_idle()
 
     # ----------------------------------------------------------------- exposure
@@ -227,6 +352,7 @@ class OdmrApp:
         self.exposure_ms = float(applied) if applied else requested
         self.config["camera"]["exposure_ms"] = self.exposure_ms
         self._update_exposure_label(self.exposure_ms)
+        self._update_plan()
 
     def _saturation_report(self, frame: np.ndarray) -> str:
         """Fraction of pixels at (or within 1 % of) full well.
