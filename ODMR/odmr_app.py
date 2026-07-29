@@ -47,12 +47,15 @@ from odmr_sweep import (  # noqa: E402
     Roi,
     acquire_odmr_cube,
     contrast_map,
+    difference_map,
     estimate_cube_bytes,
     frequency_axis,
     load_cube,
+    mw_on_off_check,
     normalize_spectrum,
     roi_spectrum,
     save_cube,
+    summarize_difference,
 )
 from thorlabs_camera import MockThorlabsCamera, ThorlabsCamera  # noqa: E402
 from synthhd import MockSynthHD, SynthHD  # noqa: E402
@@ -73,12 +76,15 @@ class OdmrApp:
         self.min_signal_fraction = float(
             config.get("analysis", {}).get("min_signal_fraction", 0.15)
         )
+        self.diag_cfg = config.get("diagnostic", {}) or {}
 
         # Measurement results, filled in once a sweep has run (or been loaded).
         self.frequencies_mhz: np.ndarray | None = None
         self.cube: np.ndarray | None = None
         self._contrast: np.ndarray | None = None
-        self._show_contrast = False
+        self._diff_map: np.ndarray | None = None
+        self._diff_freq_mhz: float | None = None
+        self._view_mode = "pl"
         self._sweeping = False
         self._abort = False
         self.roi_patch = None
@@ -125,14 +131,16 @@ class OdmrApp:
         self.ax_spec.set_title("ODMR spectrum — run a sweep, then click the image")
         self.ax_spec.grid(True, alpha=0.3)
 
-        self.btn_sweep = Button(self.fig.add_axes([0.08, 0.04, 0.14, 0.07]), "Run sweep")
+        self.btn_sweep = Button(self.fig.add_axes([0.06, 0.04, 0.12, 0.07]), "Run sweep")
         self.btn_sweep.on_clicked(self._on_sweep_clicked)
-        self.btn_view = Button(self.fig.add_axes([0.24, 0.04, 0.16, 0.07]), "View: PL")
+        self.btn_mwcheck = Button(self.fig.add_axes([0.19, 0.04, 0.12, 0.07]), "MW check")
+        self.btn_mwcheck.on_clicked(self._on_mwcheck_clicked)
+        self.btn_view = Button(self.fig.add_axes([0.32, 0.04, 0.14, 0.07]), "View: PL")
         self.btn_view.on_clicked(self._on_view_clicked)
-        self.btn_save = Button(self.fig.add_axes([0.42, 0.04, 0.12, 0.07]), "Save")
+        self.btn_save = Button(self.fig.add_axes([0.47, 0.04, 0.10, 0.07]), "Save")
         self.btn_save.on_clicked(self._on_save_clicked)
 
-        self.status = self.fig.text(0.58, 0.06, "", fontsize=9, va="center")
+        self.status = self.fig.text(0.59, 0.06, "", fontsize=8.5, va="center")
 
         self.fig.canvas.mpl_connect("button_press_event", self._on_click)
         self.fig.canvas.mpl_connect("close_event", self._on_close)
@@ -156,7 +164,7 @@ class OdmrApp:
         self._live_timer = self.fig.canvas.new_timer(interval=100)
         self._live_timer.add_callback(self._update_live_view)
         self._live_timer.start()
-        self._set_status("Live view — press 'Run sweep' to measure.")
+        self._set_status("Live view — 'MW check' to verify NV response, 'Run sweep' to measure.")
 
     def _update_live_view(self) -> None:
         if self._sweeping or self.camera is None or self.cube is not None:
@@ -224,24 +232,123 @@ class OdmrApp:
             self.btn_sweep.label.set_text("Run sweep")
             self.fig.canvas.draw_idle()
 
+    # -------------------------------------------------- MW on/off diagnostic check
+
+    def _on_mwcheck_clicked(self, event) -> None:
+        if self.camera is None:
+            self._set_status("No hardware attached (opened from a saved file).")
+            return
+        if self._sweeping:
+            self._abort = True
+            return
+        threading.Thread(target=self._run_mw_check, daemon=True).start()
+
+    def _check_frequency(self) -> float:
+        """Frequency to park the microwave at for the on/off check.
+
+        If a sweep has already been measured, use the deepest dip it found
+        -- that is by definition where the response is strongest. Otherwise
+        fall back to the configured guess.
+        """
+        if self.cube is not None and self.frequencies_mhz is not None:
+            whole_frame = Roi(
+                x_center=self.cube.shape[2] // 2,
+                y_center=self.cube.shape[1] // 2,
+                half_size=max(self.cube.shape[1], self.cube.shape[2]),
+            )
+            spectrum = roi_spectrum(self.cube, whole_frame)
+            return float(self.frequencies_mhz[int(np.argmin(spectrum))])
+        return float(self.diag_cfg.get("check_freq_mhz", 2870.0))
+
+    def _run_mw_check(self) -> None:
+        self._sweeping = True
+        self._abort = False
+        self.btn_mwcheck.label.set_text("Abort")
+
+        freq = self._check_frequency()
+        n_cycles = int(self.diag_cfg.get("cycles", 10))
+        print(f"MW on/off check at {freq:.1f} MHz, {n_cycles} interleaved cycles.")
+
+        def on_progress(done: int, total: int) -> None:
+            self._set_status(f"MW check at {freq:.1f} MHz — cycle {done}/{total}")
+
+        try:
+            mean_off, mean_on = mw_on_off_check(
+                self.camera,
+                self.generator,
+                freq_mhz=freq,
+                power_dbm=self.mw_cfg["power_dbm"],
+                n_cycles=n_cycles,
+                settle_ms=float(self.diag_cfg.get("settle_ms", 30.0)),
+                binning=self.binning,
+                on_progress=on_progress,
+                should_abort=lambda: self._abort,
+            )
+            self._diff_map = difference_map(mean_off, mean_on, self.min_signal_fraction)
+            self._diff_freq_mhz = freq
+            stats = summarize_difference(self._diff_map)
+
+            self._view_mode = "mwcheck"
+            self._refresh_image_view()
+
+            if stats["detected"]:
+                message = (
+                    f"NV response detected at {freq:.1f} MHz — "
+                    f"{stats['responding_px']} px responding, peak drop "
+                    f"{stats['max_pct']:.2f} %, 99th pct {stats['p99_pct']:.2f} %, "
+                    f"noise {stats['noise_pct']:.2f} %."
+                )
+            else:
+                message = (
+                    f"NO clear response at {freq:.1f} MHz (noise "
+                    f"{stats['noise_pct']:.2f} %). Check: laser on the NV spot? "
+                    f"emission filter passing NV PL? MW antenna coupled? "
+                    f"is {freq:.1f} MHz actually a resonance?"
+                )
+            print(message)
+            self._set_status(message)
+        except Exception as exc:
+            print(f"MW check failed: {exc}")
+            self._set_status(f"MW check failed: {exc}")
+        finally:
+            self._sweeping = False
+            self.btn_mwcheck.label.set_text("MW check")
+            self.fig.canvas.draw_idle()
+
     # ------------------------------------------------------------ image display
 
+    def _available_views(self) -> list[str]:
+        views = []
+        if self.cube is not None:
+            views += ["pl", "contrast"]
+        if self._diff_map is not None:
+            views.append("mwcheck")
+        return views
+
     def _refresh_image_view(self) -> None:
-        if self.cube is None:
-            return
-        if self._show_contrast:
+        if self._view_mode == "mwcheck" and self._diff_map is not None:
+            self._show_image(
+                100.0 * self._diff_map,
+                f"MW on/off PL drop (%) at {self._diff_freq_mhz:.1f} MHz",
+            )
+        elif self._view_mode == "contrast" and self.cube is not None:
             self._show_image(100.0 * self._contrast, "ODMR contrast map (%) — click to read ODMR")
-        else:
+        elif self.cube is not None:
+            self._view_mode = "pl"
             self._show_image(self.cube.mean(axis=0), "Mean PL over sweep — click to read ODMR")
+        else:
+            return
+        self.btn_view.label.set_text(f"View: {self._view_mode}")
         if self.roi_patch is not None:
             self.ax_img.add_patch(self.roi_patch)
 
     def _on_view_clicked(self, event) -> None:
-        if self.cube is None:
-            self._set_status("Run a sweep first.")
+        views = self._available_views()
+        if not views:
+            self._set_status("Run a sweep or an MW check first.")
             return
-        self._show_contrast = not self._show_contrast
-        self.btn_view.label.set_text("View: contrast" if self._show_contrast else "View: PL")
+        current = views.index(self._view_mode) if self._view_mode in views else -1
+        self._view_mode = views[(current + 1) % len(views)]
         self._refresh_image_view()
 
     # --------------------------------------------------------- click -> spectrum

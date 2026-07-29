@@ -128,6 +128,148 @@ def acquire_odmr_cube(
     return frequencies_mhz[:measured], cube[:measured]
 
 
+def mw_on_off_check(
+    camera,
+    generator,
+    freq_mhz: float,
+    power_dbm: float,
+    n_cycles: int = 10,
+    settle_ms: float = 30.0,
+    binning: int = 1,
+    discard_frames: int = 1,
+    on_progress=None,
+    should_abort=None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Quick diagnostic: is the microwave modulating the photoluminescence at all?
+
+    Parks the microwave at one frequency (pick a known resonance) and
+    alternates RF off / RF on, averaging many frames of each. If NV centers
+    are being excited by the laser *and* driven by the microwave, the
+    "on" frames are measurably darker than the "off" frames. This takes
+    seconds instead of a full sweep, so it is the fastest way to confirm
+    the optical and microwave paths are working before committing to a
+    measurement.
+
+    Off and on frames are **interleaved** rather than measured in two
+    blocks, so slow drifts -- laser power wandering, NV bleaching, sample
+    creep -- affect both averages equally instead of masquerading as
+    contrast.
+
+    ``discard_frames`` frames are thrown away after each RF state change:
+    a free-running camera may already be part-way through an exposure when
+    the microwave switches, so that frame would be a mix of both states.
+
+    Returns ``(mean_off_frame, mean_on_frame)``.
+    """
+    generator.set_power_dbm(power_dbm)
+    generator.set_frequency_mhz(freq_mhz)
+
+    off_sum = on_sum = None
+    completed = 0
+    try:
+        for cycle in range(n_cycles):
+            if should_abort is not None and should_abort():
+                break
+            frames = {}
+            for state in (False, True):
+                generator.enable_rf(state)
+                if settle_ms > 0:
+                    time.sleep(settle_ms / 1000)
+                for _ in range(discard_frames):
+                    camera.get_frame()
+                frames[state] = bin_frame(camera.get_frame(), binning)
+
+            if off_sum is None:
+                off_sum = frames[False]
+                on_sum = frames[True]
+            else:
+                off_sum = off_sum + frames[False]
+                on_sum = on_sum + frames[True]
+            completed += 1
+            if on_progress is not None:
+                on_progress(completed, n_cycles)
+    finally:
+        generator.enable_rf(False)
+
+    if completed == 0:
+        raise RuntimeError("MW check aborted before any frames were acquired")
+    return off_sum / completed, on_sum / completed
+
+
+def difference_map(
+    mean_off: np.ndarray, mean_on: np.ndarray, min_signal_fraction: float = 0.15
+) -> np.ndarray:
+    """Fractional PL drop caused by the microwave, ``(off - on) / off``.
+
+    Positive where the microwave darkens the photoluminescence, i.e. where
+    NV centers are responding. As in :func:`contrast_map`, pixels dimmer
+    than ``min_signal_fraction`` of the brightest pixel are blanked so
+    that shot noise on a near-zero background cannot fake a large signal.
+    """
+    with np.errstate(divide="ignore", invalid="ignore"):
+        diff = (mean_off - mean_on) / np.maximum(mean_off, 1e-9)
+    threshold = min_signal_fraction * float(mean_off.max())
+    return np.where(mean_off >= threshold, np.nan_to_num(diff), 0.0)
+
+
+def summarize_difference(diff: np.ndarray, sigma_threshold: float = 5.0) -> dict:
+    """Decide whether a MW on/off check actually saw an NV response.
+
+    A real ODMR response can only *darken* the photoluminescence, so the
+    negative side of the difference distribution is pure measurement
+    noise. That gives a self-calibrating test: count pixels darker than
+    ``+threshold`` and brighter than ``-threshold`` for the same
+    threshold. Noise alone produces the two counts in equal numbers, while
+    a genuine response piles up only on the positive side. The *excess*
+    of positives over negatives is therefore the number of pixels really
+    responding, and it needs no absolute contrast cutoff -- important
+    because per-pixel noise varies strongly with brightness across the
+    frame, so any fixed "> 0.5 %" rule would misfire on the dim pixels.
+
+    The noise width itself is estimated robustly (via the median absolute
+    deviation of the negative tail) so that a large real signal cannot
+    inflate it.
+    """
+    signal = diff[diff != 0.0]
+    empty = {
+        "max_pct": 0.0,
+        "p99_pct": 0.0,
+        "noise_pct": 0.0,
+        "responding_px": 0,
+        "false_positive_px": 0,
+        "detected": False,
+    }
+    if signal.size == 0:
+        return empty
+
+    negative_tail = signal[signal < 0]
+    if negative_tail.size < 10:
+        return empty
+    # For zero-centred noise, median(|x|) = 0.6745 sigma.
+    noise = 1.4826 * float(np.median(np.abs(negative_tail)))
+    if noise <= 0:
+        return empty
+
+    threshold = sigma_threshold * noise
+    n_positive = int(np.count_nonzero(signal > threshold))
+    n_negative = int(np.count_nonzero(signal < -threshold))
+    excess = max(n_positive - n_negative, 0)
+
+    # Require the positive tail to clearly dominate the (noise-only)
+    # negative tail, and the excess to cover a non-negligible patch of the
+    # frame rather than a handful of stray pixels.
+    detected = n_positive > 3 * max(n_negative, 1) and excess > 0.0005 * signal.size
+
+    return {
+        "max_pct": 100.0 * float(np.max(signal)),
+        "p99_pct": 100.0 * float(np.percentile(signal, 99)),
+        "noise_pct": 100.0 * noise,
+        "responding_px": excess,
+        "false_positive_px": n_negative,
+        "detected": detected,
+    }
+
+
 def roi_spectrum(cube: np.ndarray, roi: Roi) -> np.ndarray:
     """ODMR spectrum (mean PL vs. frequency index) for one ROI of the cube."""
     ys, xs = roi.slices(cube.shape)

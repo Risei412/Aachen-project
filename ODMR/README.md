@@ -33,20 +33,69 @@ and you can probe as many points as you like from one measurement.
 ## Using the app
 
 1. The app opens on a **live view** — use it to focus and position the sample.
-2. Press **"Run sweep"**. Progress is shown as the frequency advances; press
+2. Press **"MW check"** first (see below) to confirm the NV centers are
+   actually responding, before spending minutes on a full sweep.
+3. Press **"Run sweep"**. Progress is shown as the frequency advances; press
    the same button (now "Abort") to stop early and keep the points measured
    so far.
-3. When the sweep finishes the image is displayed. **Click anywhere on it**
+4. When the sweep finishes the image is displayed. **Click anywhere on it**
    to plot that spot's ODMR spectrum in the right-hand panel. The status
    line reports the deepest dip frequency and the contrast.
-4. **"View: PL" / "View: contrast"** toggles between the mean
-   photoluminescence image and the per-pixel ODMR contrast map. The
-   contrast map shows where the microwave actually modulates the PL, i.e.
-   where the NV centers are — useful for finding the NV layer before
-   picking readout spots.
-5. **"Save"** writes the datacube to `data/odmr_<timestamp>.npz`. Re-open it
+5. **"View"** cycles the left panel through the mean photoluminescence
+   image, the per-pixel ODMR contrast map, and the MW-check difference map
+   (whichever are available). The contrast map shows where the microwave
+   actually modulates the PL, i.e. where the NV centers are — useful for
+   finding the NV layer before picking readout spots.
+6. **"Save"** writes the datacube to `data/odmr_<timestamp>.npz`. Re-open it
    later with `python odmr_app.py --load data/odmr_....npz` to keep clicking
    around the data with no hardware attached.
+
+## "MW check" — is anything actually working?
+
+Before committing to a full sweep, this button answers the question *are
+the NV centers responding at all?* in a few seconds.
+
+It parks the microwave at one frequency and **interleaves** RF off / RF on
+frames, averaging many of each. Interleaving matters: measuring all the
+"off" frames and then all the "on" frames would let a slow drift — laser
+power wandering, NV bleaching, sample creep — masquerade as ODMR contrast.
+The app also discards one frame after each RF switch, since a free-running
+camera may be part-way through an exposure when the microwave changes.
+
+The result is displayed as a **PL drop map** and summarised in the status
+line, e.g.
+
+```
+NV response detected at 2820.0 MHz — 36042 px responding, peak drop 13.96 %, ...
+NO clear response at 2870.0 MHz (noise 0.14 %). Check: laser on the NV spot? ...
+```
+
+The detection test is self-calibrating rather than a fixed contrast cutoff.
+A real ODMR response can only *darken* the photoluminescence, so the
+negative side of the difference distribution is pure noise. Counting
+pixels beyond `+threshold` and beyond `-threshold` and taking the excess
+gives the number genuinely responding — necessary because per-pixel noise
+varies strongly with brightness, so a fixed "> 0.5 %" rule reports false
+positives on the dim pixels.
+
+**Set `diagnostic.check_freq_mhz` to a frequency you expect to be a
+resonance** (2870 MHz at zero field; a split value if you have a bias
+field). Parking off-resonance correctly reports "no response" — that is
+the test working, not a fault. Once a sweep has been measured the app
+ignores the config value and uses the deepest dip it actually found.
+
+If it reports no response, work through:
+
+1. **Emission filter** — a long-pass (≈650 nm) or NV band-pass must sit in
+   front of the camera. Without it you are imaging scattered green
+   excitation light, which carries no ODMR contrast no matter what the
+   microwave does.
+2. **Laser actually on the NV** — with the filter in, the NV grains should
+   still be visible. If everything goes dark, you were seeing only
+   reflection and the laser is not exciting NV.
+3. **Microwave coupling** — is the antenna/loop close enough to the sample,
+   is the SynthHD output enabled, is the power reasonable?
+4. **Frequency** — the parked frequency must be a genuine resonance.
 
 ## 1. Try it without hardware first
 
@@ -125,4 +174,7 @@ Sweep time is roughly
 | `sweep.frames_per_point` | Frames averaged per frequency; trades sweep time for SNR. |
 | `camera.binning` | Cuts datacube size by N² and raises per-pixel SNR. |
 | `roi.half_size_px` | Larger ROI averages more pixels (smoother spectrum) but blurs spatial detail. |
+| `diagnostic.check_freq_mhz` | Frequency the "MW check" parks at. Must be a real resonance or the check correctly reports nothing. Ignored once a sweep has run. |
+| `diagnostic.cycles` | Interleaved off/on pairs averaged by the MW check; more cycles = lower noise floor. |
+| `diagnostic.settle_ms` | Wait after each RF switch during the MW check. Set at least as long as `camera.exposure_ms`. |
 | `analysis.min_signal_fraction` | Contrast-map threshold. Dark pixels have near-zero mean PL, so their shot noise produces huge spurious "contrast"; pixels below this fraction of the brightest pixel are blanked. Lower it if a genuinely dim part of the sample is being masked. |

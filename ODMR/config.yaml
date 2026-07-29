@@ -30,5 +30,14 @@ analysis:
                               # fraction of the brightest pixel are blanked, so
                               # shot noise in dark areas doesn't swamp the scale
 
+diagnostic:                   # settings for the "MW check" button (quick NV response test)
+  check_freq_mhz: 2820.0      # frequency to park the MW at. Use a KNOWN resonance:
+                              # 2870 MHz for zero field, or a dip found by a previous
+                              # sweep. (2820 matches the simulated resonance in mock
+                              # mode.) Once a sweep has run, the app ignores this and
+                              # uses the deepest dip it actually measured.
+  cycles: 10                  # interleaved off/on pairs to average
+  settle_ms: 30.0             # wait after each RF switch; set >= camera exposure_ms
+
 output:
   directory: "data"     # where "Save" writes the .npz datacubes
