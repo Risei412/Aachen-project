@@ -1,0 +1,23 @@
+# Configuration for the click-to-measure ODMR application (ODMR/odmr_app.py).
+# Copy this file if you need per-session variants, e.g. config_run2.yaml,
+# and point the app at it with: python odmr_app.py --config config_run2.yaml
+
+mock: true            # true = run with simulated camera/generator (no hardware needed)
+
+camera:
+  exposure_ms: 20.0    # camera exposure time per frame, in milliseconds
+
+microwave:
+  port: "COM5"         # Windows: COMx. Linux: /dev/ttyACM0 or /dev/ttyUSB0
+  channel: 0           # 0 = channel A, 1 = channel B
+  power_dbm: 0.0        # RF power sent to the MW antenna/loop near the sample
+
+sweep:
+  start_mhz: 2800.0     # start frequency of the ODMR sweep
+  stop_mhz: 2940.0      # stop frequency of the ODMR sweep
+  step_mhz: 1.0          # frequency step size
+  settle_ms: 5.0          # wait time after setting frequency, before capturing a frame
+  frames_per_point: 3     # frames averaged at each frequency (reduces shot noise)
+
+roi:
+  half_size_px: 15      # clicked point +/- this many pixels defines the square ROI

@@ -1,0 +1,23 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "ODMR: click-to-measure (mock hardware)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/ODMR/odmr_app.py",
+            "args": ["--mock"],
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "ODMR: click-to-measure (real hardware)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/ODMR/odmr_app.py",
+            "args": ["--no-mock"],
+            "console": "integratedTerminal",
+            "justMyCode": true
+        }
+    ]
+}

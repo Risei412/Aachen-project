@@ -1,0 +1,9 @@
+numpy
+matplotlib
+pyyaml
+pyserial
+
+# Thorlabs camera SDK is NOT on PyPI: install it from the wheel that ships
+# with the ThorCam installer (see Equipments/CMOS camera/thorlabs_camera.py
+# for the exact path). Only needed when running with mock: false.
+# thorlabs_tsi_sdk
