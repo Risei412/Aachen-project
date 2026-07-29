@@ -101,6 +101,58 @@ Aborting mid-way is safe: each frequency point is divided by the number of
 times it was actually measured, and points never reached are dropped. The
 status line says so when the repeats came out uneven.
 
+## Noise and systematics
+
+Several defaults exist specifically to keep slow drift and outliers out of
+the result. They cost measurement time, so they are all adjustable.
+
+**Discarded frames after each change** (`sweep.discard_frames`,
+`diagnostic.discard_frames`). A free-running camera can already be
+mid-exposure when the microwave frequency or RF state changes, so that
+frame straddles two conditions. Keeping it blurs adjacent frequency points
+together and adds comb-like structure to the noise floor. One discarded
+frame is usually enough; `sweep.settle_ms` should also be at least as long
+as the exposure.
+
+**ABBA ordering in the MW check.** Each cycle runs OFF-ON-ON-OFF rather
+than a plain OFF/ON pair. With a plain pair the two states sit a fixed time
+apart, so a *linear* drift biases every cycle identically and survives
+averaging as a false contrast. Under ABBA the mean acquisition time of the
+OFF frames equals that of the ON frames, so linear drift cancels within
+each cycle. Measured on a simulated camera whose laser decays 0.1 % per
+frame, with the microwave parked off resonance (true contrast exactly 0):
+
+| drift per frame | plain OFF/ON | ABBA |
+| --- | --- | --- |
+| 0 | +0.0009 % | +0.0004 % |
+| 0.02 % | +0.0407 % | +0.0004 % |
+| 0.05 % | +0.1021 % | +0.0005 % |
+| 0.10 % | +0.2054 % | +0.0008 % |
+
+A 0.2 % false contrast is easily mistaken for a weak real NV signal.
+
+**Robust baseline normalisation** (`analysis.baseline_correction`). The
+spectrum is divided by a straight line fitted to the off-resonance level,
+not by its single brightest point. Dividing by the maximum lets one upward
+noise spike define 100 %, and leaves any drift-induced tilt in the
+lineshape. The fit iteratively rejects points lying *below* it — one-sided,
+because a resonance can only darken the photoluminescence, so downward
+outliers are signal and upward ones are noise. That means it finds the
+baseline wherever the dips happen to sit, including near the ends of the
+sweep. (A fixed "fit the two ends" rule fails on the default 2800–2940 MHz
+range, since NV resonances near 2820/2920 land inside the end windows and
+drag the fit down.) Measured against a known 8.080 % contrast:
+
+| spectrum | divide-by-max | robust fit |
+| --- | --- | --- |
+| clean | +0.010 pp | −0.006 pp |
+| one +3 % noise spike | +1.684 pp | +0.120 pp |
+| 4 % linear tilt | +3.147 pp | −0.006 pp |
+
+**Significance flag.** When a dip is smaller than 3× its own error bar the
+status line says `(below 3x error — not significant)`, so a number is not
+quoted as a measurement when it is a fluctuation.
+
 ## "MW check" — is anything actually working?
 
 Before committing to a full sweep, this button answers the question *are
@@ -240,6 +292,11 @@ Sweep time is roughly
 | `sweep.repeats` | Sweeps averaged together. Noise falls as √repeats, time grows linearly. |
 | `sweep.alternate_direction` | Reverses every 2nd repeat so slow drift cancels instead of tilting the lineshape. |
 | `sweep.estimate_errors` | Error bars from between-repeat scatter. Doubles acquisition memory; no effect at `repeats: 1`. |
+| `sweep.discard_frames` | Frames dropped after each frequency change so no frame straddles two frequencies. |
+| `sweep.settle_ms` | PLL lock time after a frequency step; set at least as long as `camera.exposure_ms`. |
+| `analysis.baseline_correction` | Robust line fit for normalisation instead of divide-by-max. |
+| `analysis.baseline_reject_sigma` | How far below the fit a point must lie to be treated as signal and excluded. |
+| `diagnostic.cycles` | ABBA cycles averaged by the MW check (4 frames each). |
 | `diagnostic.check_freq_mhz` | Frequency the "MW check" parks at. Must be a real resonance or the check correctly reports nothing. Ignored once a sweep has run. |
 | `diagnostic.cycles` | Interleaved off/on pairs averaged by the MW check; more cycles = lower noise floor. |
 | `diagnostic.settle_ms` | Wait after each RF switch during the MW check. Set at least as long as `camera.exposure_ms`. |

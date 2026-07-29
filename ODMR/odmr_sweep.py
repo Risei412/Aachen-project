@@ -98,6 +98,7 @@ def acquire_odmr_cube(
     power_dbm: float,
     settle_ms: float = 5.0,
     frames_per_point: int = 1,
+    discard_frames: int = 1,
     binning: int = 1,
     repeats: int = 1,
     alternate_direction: bool = True,
@@ -126,6 +127,12 @@ def acquire_odmr_cube(
     what lets the plotted spectrum carry error bars, which is the only way
     to tell a shallow real dip from a noise excursion. It has no effect
     when ``repeats`` is 1, since a single measurement has no scatter.
+
+    ``discard_frames`` throws away the first camera frame(s) after every
+    frequency change. With a free-running camera that frame can straddle
+    the old and the new microwave frequency -- especially when the exposure
+    is longer than ``settle_ms`` -- so keeping it mixes adjacent frequency
+    points together and adds a comb-like structure to the noise floor.
 
     ``on_progress(repeat, index, freq_mhz, frame)`` is called after each
     frequency point. ``should_abort()`` is polled between points; returning
@@ -161,6 +168,8 @@ def acquire_odmr_cube(
                 generator.set_frequency_mhz(freq)
                 if settle_ms > 0:
                     time.sleep(settle_ms / 1000)
+                for _ in range(max(0, int(discard_frames))):
+                    camera.get_frame()
 
                 accumulator = bin_frame(camera.get_frame(), binning)
                 for _ in range(frames_per_point - 1):
@@ -235,7 +244,12 @@ def mw_on_off_check(
     Off and on frames are **interleaved** rather than measured in two
     blocks, so slow drifts -- laser power wandering, NV bleaching, sample
     creep -- affect both averages equally instead of masquerading as
-    contrast.
+    contrast. Each cycle further uses a symmetric OFF-ON-ON-OFF (ABBA)
+    order: a plain OFF/ON pair leaves the two states separated by a fixed
+    time offset, so a *linear* drift biases every cycle the same way and
+    survives averaging as a false contrast. With ABBA the mean acquisition
+    time of the OFF frames equals that of the ON frames, so a linear drift
+    cancels exactly within each cycle.
 
     ``discard_frames`` frames are thrown away after each RF state change:
     a free-running camera may already be part-way through an exposure when
@@ -252,21 +266,23 @@ def mw_on_off_check(
         for cycle in range(n_cycles):
             if should_abort is not None and should_abort():
                 break
-            frames = {}
-            for state in (False, True):
+            off_frames, on_frames = [], []
+            for state in (False, True, True, False):
                 generator.enable_rf(state)
                 if settle_ms > 0:
                     time.sleep(settle_ms / 1000)
-                for _ in range(discard_frames):
+                for _ in range(max(0, int(discard_frames))):
                     camera.get_frame()
-                frames[state] = bin_frame(camera.get_frame(), binning)
+                frame = bin_frame(camera.get_frame(), binning)
+                (on_frames if state else off_frames).append(frame)
 
+            cycle_off = 0.5 * (off_frames[0] + off_frames[1])
+            cycle_on = 0.5 * (on_frames[0] + on_frames[1])
             if off_sum is None:
-                off_sum = frames[False]
-                on_sum = frames[True]
+                off_sum, on_sum = cycle_off, cycle_on
             else:
-                off_sum = off_sum + frames[False]
-                on_sum = on_sum + frames[True]
+                off_sum = off_sum + cycle_off
+                on_sum = on_sum + cycle_on
             completed += 1
             if on_progress is not None:
                 on_progress(completed, n_cycles)

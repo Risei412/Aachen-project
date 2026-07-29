@@ -77,9 +77,11 @@ class OdmrApp:
         self.roi_half_size = int(config["roi"]["half_size_px"])
         roi_limits = config["roi"].get("half_size_limits", [1, 60])
         self.roi_half_size_limits = (int(roi_limits[0]), int(roi_limits[1]))
-        self.min_signal_fraction = float(
-            config.get("analysis", {}).get("min_signal_fraction", 0.15)
-        )
+        analysis_cfg = config.get("analysis", {}) or {}
+        self.min_signal_fraction = float(analysis_cfg.get("min_signal_fraction", 0.15))
+        self.baseline_correction = bool(analysis_cfg.get("baseline_correction", True))
+        self.baseline_reject_sigma = float(analysis_cfg.get("baseline_reject_sigma", 2.5))
+        self.baseline_iterations = int(analysis_cfg.get("baseline_iterations", 8))
         self.diag_cfg = config.get("diagnostic", {}) or {}
         freq_limits = config["microwave"].get("freq_limits_mhz", [54.0, 13600.0])
         self.freq_limits_mhz = (float(freq_limits[0]), float(freq_limits[1]))
@@ -299,10 +301,12 @@ class OdmrApp:
         repeats = int(self.sweep_cfg.get("repeats", 1))
         n_points = int(round((stop - start) / step)) + 1
 
-        per_frame_ms = self.exposure_ms
+        # Discarded frames still cost an exposure each, so they belong in the
+        # time estimate even though they never reach the datacube.
         frames = int(self.sweep_cfg.get("frames_per_point", 1))
+        discarded = int(self.sweep_cfg.get("discard_frames", 1))
         settle = float(self.sweep_cfg.get("settle_ms", 0.0))
-        seconds = n_points * repeats * (settle + frames * per_frame_ms) / 1000.0
+        seconds = n_points * repeats * (settle + (frames + discarded) * self.exposure_ms) / 1000.0
 
         # Frame shape is cached rather than re-grabbed: this runs on every
         # keystroke-submit, and pulling a frame from the camera each time
@@ -437,6 +441,7 @@ class OdmrApp:
                 power_dbm=self.mw_cfg["power_dbm"],
                 settle_ms=self.sweep_cfg["settle_ms"],
                 frames_per_point=self.sweep_cfg["frames_per_point"],
+                discard_frames=int(self.sweep_cfg.get("discard_frames", 1)),
                 binning=self.binning,
                 repeats=repeats,
                 alternate_direction=bool(self.sweep_cfg.get("alternate_direction", True)),
@@ -522,6 +527,7 @@ class OdmrApp:
                 power_dbm=self.mw_cfg["power_dbm"],
                 n_cycles=n_cycles,
                 settle_ms=float(self.diag_cfg.get("settle_ms", 30.0)),
+                discard_frames=int(self.diag_cfg.get("discard_frames", 1)),
                 binning=self.binning,
                 on_progress=on_progress,
                 should_abort=lambda: self._abort,
@@ -634,24 +640,78 @@ class OdmrApp:
         )
         self.ax_img.add_patch(self.roi_patch)
 
+    def _spectrum_baseline(self, raw: np.ndarray) -> np.ndarray:
+        """Off-resonance baseline the spectrum is normalised against.
+
+        Dividing by the single brightest point (the obvious choice) is
+        fragile: one upward noise spike then defines 100 %, pushing the
+        whole curve down and inflating the apparent contrast. It also
+        leaves any linear baseline tilt from slow drift in the lineshape.
+
+        So fit a straight line instead -- but fit it *robustly*. Fitting
+        the two ends of the sweep only works if the resonances happen to
+        sit in the middle; with the default 2800-2940 MHz range and NV
+        resonances near 2820/2920 the dips fall inside the end windows,
+        drag the fit down, and the contrast comes out badly under-reported.
+
+        Instead fit all points and iteratively reject those lying well
+        *below* the fit. Rejection is one-sided because an ODMR resonance
+        can only darken the photoluminescence: downward outliers are
+        signal, upward ones are noise. The scale is set by the median
+        absolute deviation, which the dips cannot inflate as long as they
+        occupy a minority of the sweep. The fit therefore converges onto
+        the off-resonance baseline wherever the resonances happen to lie.
+        """
+        n = len(raw)
+        fallback = np.full(n, float(np.max(raw)))
+        if not self.baseline_correction or n < 5:
+            return fallback
+
+        x = np.asarray(self.frequencies_mhz, dtype=float)
+        mask = np.ones(n, dtype=bool)
+        baseline = fallback
+        for _ in range(self.baseline_iterations):
+            if mask.sum() < max(4, int(0.2 * n)):
+                break  # too few points left to trust the fit
+            try:
+                coefficients = np.polyfit(x[mask], raw[mask], 1)
+            except (np.linalg.LinAlgError, ValueError):
+                return fallback
+            baseline = np.polyval(coefficients, x)
+
+            residual = raw - baseline
+            spread = 1.4826 * float(np.median(np.abs(residual - np.median(residual))))
+            if spread <= 0:
+                break
+            keep = residual > -self.baseline_reject_sigma * spread
+            if np.array_equal(keep, mask):
+                break
+            mask = keep
+
+        if not np.all(np.isfinite(baseline)) or np.any(baseline <= 0):
+            return fallback
+        return baseline
+
     def _plot_spectrum(self, roi: Roi) -> None:
         raw = roi_spectrum(self.cube, roi)
-        reference = float(np.max(raw))
-        if reference <= 0:
+        if float(np.max(raw)) <= 0:
             self._set_status("ROI has no signal.")
             return
-        normalised = 100.0 * raw / reference
+
+        baseline = self._spectrum_baseline(raw)
+        normalised = 100.0 * raw / baseline
 
         self.spectrum_line.set_data(self.frequencies_mhz, normalised)
 
-        # Error band from the scatter between repeats, normalised the same
-        # way as the spectrum so the two are on one axis.
+        # Error band from the scatter between repeats, divided by the same
+        # per-point baseline as the spectrum so both share one axis.
         if self._error_band is not None:
             self._error_band.remove()
             self._error_band = None
         error = roi_spectrum_error(self.sem, roi)
-        if error is not None and np.any(np.isfinite(error)):
-            error_pct = 100.0 * error / reference
+        has_error = error is not None and np.any(np.isfinite(error))
+        if has_error:
+            error_pct = 100.0 * error / baseline
             self._error_band = self.ax_spec.fill_between(
                 self.frequencies_mhz,
                 normalised - error_pct,
@@ -665,19 +725,25 @@ class OdmrApp:
         self.ax_spec.autoscale_view()
         n_pixels = (2 * roi.half_size + 1) ** 2
         self.ax_spec.set_title(
-            f"ODMR at pixel ({roi.x_center}, {roi.y_center}) — "
+            f"ODMR ROI centred at ({roi.x_center}, {roi.y_center}) — "
             f"{n_pixels} px averaged, {self.repeats_completed} repeat(s)"
         )
 
-        dip_freq = float(self.frequencies_mhz[int(np.argmin(normalised))])
-        contrast_pct = 100.0 - float(np.min(normalised))
+        dip_index = int(np.argmin(normalised))
+        dip_freq = float(self.frequencies_mhz[dip_index])
+        contrast_pct = 100.0 - float(normalised[dip_index])
         message = (
             f"ROI ({roi.x_center}, {roi.y_center}) ±{roi.half_size} px: "
             f"deepest dip {dip_freq:.1f} MHz, contrast {contrast_pct:.2f} %"
         )
-        if error is not None and np.any(np.isfinite(error)):
-            typical_error = 100.0 * float(np.nanmedian(error)) / reference
+        if has_error:
+            typical_error = float(np.nanmedian(100.0 * error / baseline))
             message += f", error ±{typical_error:.3f} %"
+            # A dip smaller than a few times its own error bar is not a
+            # measurement, it is a fluctuation -- say so rather than letting
+            # the number stand on its own.
+            if typical_error > 0 and contrast_pct < 3.0 * typical_error:
+                message += " (below 3x error — not significant)"
         self._set_status(message)
         self.fig.canvas.draw_idle()
 
