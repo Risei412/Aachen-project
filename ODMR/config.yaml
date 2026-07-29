@@ -8,7 +8,7 @@ camera:
   exposure_ms: 20.0    # camera exposure time per frame, in milliseconds
 
 microwave:
-  port: "COM5"         # Windows: COMx. Linux: /dev/ttyACM0 or /dev/ttyUSB0
+  port: "COM7"         # Windows: COMx. Linux: /dev/ttyACM0 or /dev/ttyUSB0
   channel: 0           # 0 = channel A, 1 = channel B
   power_dbm: 0.0        # RF power sent to the MW antenna/loop near the sample
 

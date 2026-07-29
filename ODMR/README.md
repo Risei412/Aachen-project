@@ -74,7 +74,7 @@ Once both are wired up, edit `ODMR/config.yaml`:
 ```yaml
 mock: false
 microwave:
-  port: "COM5"          # or /dev/ttyACM0
+  port: "COM7"          # or /dev/ttyACM0
 sweep:
   start_mhz: 2800.0      # tune to bracket your expected NV resonances
   stop_mhz: 2940.0
