@@ -32,10 +32,23 @@ sweep:
   step_mhz: 1.0          # frequency step size
   settle_ms: 5.0          # wait time after setting frequency, before capturing a frame
   frames_per_point: 3     # frames averaged at each frequency (reduces shot noise)
+  repeats: 1              # how many times to repeat the whole sweep and average.
+                          # SNR improves as sqrt(repeats); total time scales linearly.
+  alternate_direction: true   # run every 2nd repeat high->low. Slow drift (laser
+                          # power, NV bleaching, sample creep) otherwise correlates
+                          # with frequency, since frequency is always visited in the
+                          # same time order, and can tilt or fake a lineshape.
+                          # Alternating makes the drift cancel on averaging instead.
+  estimate_errors: true   # also accumulate sum-of-squares so the spectrum gets error
+                          # bars from the scatter between repeats. Doubles the memory
+                          # used while acquiring. No effect when repeats is 1.
 
 roi:
   half_size_px: 8       # clicked point +/- this many (binned) pixels is averaged
-                        # into the displayed ODMR spectrum
+                        # into the displayed ODMR spectrum. Adjustable live from the
+                        # GUI slider; it re-reads the existing datacube, so changing
+                        # it after a sweep costs nothing.
+  half_size_limits: [1, 60]   # range of the ROI slider
 
 analysis:
   min_signal_fraction: 0.15   # contrast-map threshold: pixels dimmer than this

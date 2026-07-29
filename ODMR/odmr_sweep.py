@@ -75,6 +75,22 @@ def estimate_cube_bytes(n_freq: int, height: int, width: int, binning: int = 1) 
     return n_freq * (height // binning) * (width // binning) * 4
 
 
+@dataclass
+class OdmrResult:
+    """A completed (or aborted) widefield ODMR measurement."""
+
+    frequencies_mhz: np.ndarray
+    cube: np.ndarray                  # (n_freq, h, w), mean over repeats
+    counts: np.ndarray                # (n_freq,), times each point was measured
+    sem: np.ndarray | None            # (n_freq, h, w), standard error of the mean
+    repeats_completed: int
+
+    @property
+    def fully_averaged(self) -> bool:
+        """True when every frequency point got the same number of repeats."""
+        return bool(np.all(self.counts == self.counts[0])) if self.counts.size else False
+
+
 def acquire_odmr_cube(
     camera,
     generator,
@@ -83,49 +99,115 @@ def acquire_odmr_cube(
     settle_ms: float = 5.0,
     frames_per_point: int = 1,
     binning: int = 1,
+    repeats: int = 1,
+    alternate_direction: bool = True,
+    estimate_errors: bool = True,
     on_progress=None,
     should_abort=None,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Sweep the microwave once, storing a full camera frame per frequency.
+) -> OdmrResult:
+    """Sweep the microwave, storing a full camera frame per frequency point.
 
-    ``on_progress(index, freq_mhz, frame)`` is called after each frequency
-    point so a GUI can show the sweep advancing. ``should_abort()`` is
-    polled between points; return True from it to stop early (the cube is
-    then truncated to the points actually measured).
+    With ``repeats > 1`` the whole sweep is repeated and the frames at each
+    frequency are averaged, improving signal-to-noise as sqrt(repeats).
 
-    Returns ``(frequencies_mhz, cube)`` where ``cube`` has shape
-    ``(n_freq, height, width)`` and dtype float32.
+    ``alternate_direction`` runs every second repeat from high to low
+    frequency. This matters more than it looks: any slow drift during the
+    measurement -- laser power wandering, NV bleaching, the sample creeping
+    under pressure -- otherwise correlates with frequency, because
+    frequency is always visited in the same time order. A downward-drifting
+    baseline would then tilt the spectrum and could be mistaken for (or
+    could hide) a real resonance. Alternating the direction makes the
+    drift symmetric about the middle of the sweep instead, so averaging
+    largely cancels it rather than baking it into the lineshape.
+
+    ``estimate_errors`` additionally accumulates the sum of squares so a
+    per-point standard error can be computed from the scatter *between*
+    repeats. That doubles the memory used during acquisition, but it is
+    what lets the plotted spectrum carry error bars, which is the only way
+    to tell a shallow real dip from a noise excursion. It has no effect
+    when ``repeats`` is 1, since a single measurement has no scatter.
+
+    ``on_progress(repeat, index, freq_mhz, frame)`` is called after each
+    frequency point. ``should_abort()`` is polled between points; returning
+    True stops early. Points measured a different number of times are still
+    averaged correctly -- each is divided by its own count -- and points
+    never reached are dropped.
     """
     frequencies_mhz = np.asarray(frequencies_mhz, dtype=float)
     n_freq = len(frequencies_mhz)
+    repeats = max(1, int(repeats))
 
     probe = bin_frame(camera.get_frame(), binning)
-    cube = np.zeros((n_freq, probe.shape[0], probe.shape[1]), dtype=np.float32)
+    shape = (n_freq, probe.shape[0], probe.shape[1])
+    sums = np.zeros(shape, dtype=np.float32)
+    sums_sq = np.zeros(shape, dtype=np.float32) if (estimate_errors and repeats > 1) else None
+    counts = np.zeros(n_freq, dtype=np.int32)
 
     generator.set_power_dbm(power_dbm)
     generator.enable_rf(True)
-    measured = 0
+    repeats_completed = 0
+    aborted = False
     try:
-        for i, freq in enumerate(frequencies_mhz):
-            if should_abort is not None and should_abort():
+        for repeat in range(repeats):
+            order = range(n_freq)
+            if alternate_direction and repeat % 2 == 1:
+                order = range(n_freq - 1, -1, -1)
+
+            for i in order:
+                if should_abort is not None and should_abort():
+                    aborted = True
+                    break
+                freq = float(frequencies_mhz[i])
+                generator.set_frequency_mhz(freq)
+                if settle_ms > 0:
+                    time.sleep(settle_ms / 1000)
+
+                accumulator = bin_frame(camera.get_frame(), binning)
+                for _ in range(frames_per_point - 1):
+                    accumulator += bin_frame(camera.get_frame(), binning)
+                frame = accumulator / frames_per_point
+
+                sums[i] += frame
+                if sums_sq is not None:
+                    sums_sq[i] += frame.astype(np.float32) ** 2
+                counts[i] += 1
+
+                if on_progress is not None:
+                    on_progress(repeat, i, freq, frame)
+
+            if aborted:
                 break
-            generator.set_frequency_mhz(float(freq))
-            if settle_ms > 0:
-                time.sleep(settle_ms / 1000)
-
-            accumulator = bin_frame(camera.get_frame(), binning)
-            for _ in range(frames_per_point - 1):
-                accumulator += bin_frame(camera.get_frame(), binning)
-            frame = accumulator / frames_per_point
-
-            cube[i] = frame
-            measured = i + 1
-            if on_progress is not None:
-                on_progress(i, float(freq), frame)
+            repeats_completed += 1
     finally:
         generator.enable_rf(False)
 
-    return frequencies_mhz[:measured], cube[:measured]
+    measured = counts > 0
+    if not np.any(measured):
+        raise RuntimeError("Sweep aborted before any frequency point was measured")
+
+    freqs_out = frequencies_mhz[measured]
+    counts_out = counts[measured]
+    sums_out = sums[measured]
+    divisor = counts_out[:, None, None].astype(np.float32)
+    cube = sums_out / divisor
+
+    sem = None
+    if sums_sq is not None:
+        sq_out = sums_sq[measured]
+        with np.errstate(invalid="ignore", divide="ignore"):
+            # Unbiased variance between repeats, then the error on their mean.
+            variance = (sq_out - sums_out ** 2 / divisor) / np.maximum(divisor - 1.0, 1.0)
+            sem = np.sqrt(np.maximum(variance, 0.0) / divisor).astype(np.float32)
+        # A point measured only once has no scatter to estimate an error from.
+        sem[counts_out < 2] = np.nan
+
+    return OdmrResult(
+        frequencies_mhz=freqs_out,
+        cube=cube,
+        counts=counts_out,
+        sem=sem,
+        repeats_completed=repeats_completed,
+    )
 
 
 def mw_on_off_check(
@@ -276,6 +358,24 @@ def roi_spectrum(cube: np.ndarray, roi: Roi) -> np.ndarray:
     return cube[:, ys, xs].mean(axis=(1, 2))
 
 
+def roi_spectrum_error(sem: np.ndarray | None, roi: Roi) -> np.ndarray | None:
+    """Standard error of the ROI-averaged spectrum.
+
+    Averaging ``n`` pixels whose individual standard errors are ``s_i``
+    gives an error on the mean of ``sqrt(sum s_i^2) / n`` -- the errors add
+    in quadrature, not linearly, so a larger ROI tightens the error bars as
+    well as smoothing the image.
+    """
+    if sem is None:
+        return None
+    ys, xs = roi.slices(sem.shape)
+    patch = sem[:, ys, xs]
+    n_pixels = patch.shape[1] * patch.shape[2]
+    if n_pixels == 0:
+        return None
+    return np.sqrt(np.nansum(patch ** 2, axis=(1, 2))) / n_pixels
+
+
 def normalize_spectrum(spectrum: np.ndarray, reference: str = "max") -> np.ndarray:
     """Convert raw counts to normalised PL in percent.
 
@@ -317,22 +417,38 @@ def contrast_map(cube: np.ndarray, min_signal_fraction: float = 0.15) -> np.ndar
     return np.where(mean_pl >= threshold, contrast, 0.0)
 
 
-def save_cube(path: str, frequencies_mhz: np.ndarray, cube: np.ndarray, metadata: dict | None = None) -> None:
-    """Save a measured datacube (uncompressed, so saving stays fast mid-experiment)."""
+def save_cube(path: str, result: OdmrResult, metadata: dict | None = None) -> None:
+    """Save a measurement (uncompressed, so saving stays fast mid-experiment)."""
     import json
 
-    np.savez(
-        path,
-        frequencies_mhz=frequencies_mhz,
-        cube=cube,
-        metadata=json.dumps(metadata or {}),
-    )
+    arrays = {
+        "frequencies_mhz": result.frequencies_mhz,
+        "cube": result.cube,
+        "counts": result.counts,
+        "metadata": json.dumps({**(metadata or {}), "repeats_completed": result.repeats_completed}),
+    }
+    if result.sem is not None:
+        arrays["sem"] = result.sem
+    np.savez(path, **arrays)
 
 
-def load_cube(path: str) -> tuple[np.ndarray, np.ndarray, dict]:
-    """Load a datacube saved by :func:`save_cube`."""
+def load_cube(path: str) -> tuple[OdmrResult, dict]:
+    """Load a measurement saved by :func:`save_cube`."""
     import json
 
     data = np.load(path, allow_pickle=False)
     metadata = json.loads(str(data["metadata"])) if "metadata" in data else {}
-    return data["frequencies_mhz"], data["cube"], metadata
+    frequencies_mhz = data["frequencies_mhz"]
+    counts = (
+        data["counts"]
+        if "counts" in data
+        else np.ones(len(frequencies_mhz), dtype=np.int32)
+    )
+    result = OdmrResult(
+        frequencies_mhz=frequencies_mhz,
+        cube=data["cube"],
+        counts=counts,
+        sem=data["sem"] if "sem" in data else None,
+        repeats_completed=int(metadata.get("repeats_completed", 1)),
+    )
+    return result, metadata

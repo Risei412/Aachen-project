@@ -50,10 +50,12 @@ from odmr_sweep import (  # noqa: E402
     difference_map,
     estimate_cube_bytes,
     frequency_axis,
+    OdmrResult,
     load_cube,
     mw_on_off_check,
     normalize_spectrum,
     roi_spectrum,
+    roi_spectrum_error,
     save_cube,
     summarize_difference,
 )
@@ -73,6 +75,8 @@ class OdmrApp:
         self.mw_cfg = config["microwave"]
         self.binning = int(config["camera"].get("binning", 1))
         self.roi_half_size = int(config["roi"]["half_size_px"])
+        roi_limits = config["roi"].get("half_size_limits", [1, 60])
+        self.roi_half_size_limits = (int(roi_limits[0]), int(roi_limits[1]))
         self.min_signal_fraction = float(
             config.get("analysis", {}).get("min_signal_fraction", 0.15)
         )
@@ -87,6 +91,11 @@ class OdmrApp:
         # Measurement results, filled in once a sweep has run (or been loaded).
         self.frequencies_mhz: np.ndarray | None = None
         self.cube: np.ndarray | None = None
+        self.sem: np.ndarray | None = None
+        self.counts: np.ndarray | None = None
+        self.repeats_completed = 0
+        self._last_roi: Roi | None = None
+        self._error_band = None
         self._contrast: np.ndarray | None = None
         self._diff_map: np.ndarray | None = None
         self._diff_freq_mhz: float | None = None
@@ -155,7 +164,7 @@ class OdmrApp:
         # ensemble hundreds of milliseconds), which a linear slider cannot
         # resolve at both ends.
         self.slider_exposure = Slider(
-            self.fig.add_axes([0.10, 0.13, 0.36, 0.03]),
+            self.fig.add_axes([0.09, 0.13, 0.28, 0.025]),
             "Exposure",
             np.log10(self.exposure_limits_ms[0]),
             np.log10(self.exposure_limits_ms[1]),
@@ -163,6 +172,18 @@ class OdmrApp:
         )
         self.slider_exposure.on_changed(self._on_exposure_changed)
         self._update_exposure_label(self.exposure_ms)
+
+        # ROI size is re-applied to the already-measured datacube, so it can
+        # be explored freely after the sweep without re-acquiring anything.
+        self.slider_roi = Slider(
+            self.fig.add_axes([0.56, 0.13, 0.28, 0.025]),
+            "ROI ±px",
+            self.roi_half_size_limits[0],
+            self.roi_half_size_limits[1],
+            valinit=self.roi_half_size,
+            valstep=1,
+        )
+        self.slider_roi.on_changed(self._on_roi_size_changed)
 
         self.status = self.fig.text(0.59, 0.06, "", fontsize=8.5, va="center")
 
@@ -258,20 +279,32 @@ class OdmrApp:
         freqs = frequency_axis(
             self.sweep_cfg["start_mhz"], self.sweep_cfg["stop_mhz"], self.sweep_cfg["step_mhz"]
         )
+        repeats = max(1, int(self.sweep_cfg.get("repeats", 1)))
+        estimate_errors = bool(self.sweep_cfg.get("estimate_errors", True))
         probe = self.camera.get_frame()
-        n_mb = estimate_cube_bytes(len(freqs), probe.shape[0], probe.shape[1], self.binning) / 1e6
+        cube_mb = estimate_cube_bytes(len(freqs), probe.shape[0], probe.shape[1], self.binning) / 1e6
+        # The sum-of-squares accumulator doubles the working set while a
+        # repeated sweep with error estimation is running.
+        working_mb = cube_mb * (2 if (estimate_errors and repeats > 1) else 1)
         print(
-            f"Sweeping {len(freqs)} points, {self.sweep_cfg['start_mhz']}–"
-            f"{self.sweep_cfg['stop_mhz']} MHz. Datacube ≈ {n_mb:.0f} MB "
-            f"(binning={self.binning})."
+            f"Sweeping {len(freqs)} points x {repeats} repeat(s), "
+            f"{self.sweep_cfg['start_mhz']}-{self.sweep_cfg['stop_mhz']} MHz. "
+            f"Datacube ~{cube_mb:.0f} MB (working set ~{working_mb:.0f} MB, "
+            f"binning={self.binning})."
         )
 
-        def on_progress(index: int, freq_mhz: float, frame: np.ndarray) -> None:
-            self._show_image(frame, f"Sweeping… {freq_mhz:.1f} MHz")
-            self._set_status(f"Sweep {index + 1}/{len(freqs)} — {freq_mhz:.1f} MHz")
+        total_points = len(freqs) * repeats
+
+        def on_progress(repeat: int, index: int, freq_mhz: float, frame: np.ndarray) -> None:
+            done = repeat * len(freqs) + index + 1
+            self._show_image(frame, f"Sweeping... {freq_mhz:.1f} MHz")
+            self._set_status(
+                f"Repeat {repeat + 1}/{repeats} - {freq_mhz:.1f} MHz "
+                f"({done}/{total_points} frames)"
+            )
 
         try:
-            self.frequencies_mhz, self.cube = acquire_odmr_cube(
+            result = acquire_odmr_cube(
                 self.camera,
                 self.generator,
                 freqs,
@@ -279,13 +312,22 @@ class OdmrApp:
                 settle_ms=self.sweep_cfg["settle_ms"],
                 frames_per_point=self.sweep_cfg["frames_per_point"],
                 binning=self.binning,
+                repeats=repeats,
+                alternate_direction=bool(self.sweep_cfg.get("alternate_direction", True)),
+                estimate_errors=estimate_errors,
                 on_progress=on_progress,
                 should_abort=lambda: self._abort,
             )
-            self._contrast = contrast_map(self.cube, self.min_signal_fraction)
-            self._refresh_image_view()
+            self._adopt_result(result)
+
+            averaging = (
+                f"{result.repeats_completed} repeat(s) averaged"
+                if result.fully_averaged
+                else f"partial: {int(self.counts.min())}-{int(self.counts.max())} repeats per point"
+            )
             self._set_status(
-                f"Sweep done: {len(self.frequencies_mhz)} points. Click the image to read ODMR."
+                f"Sweep done: {len(self.frequencies_mhz)} points, {averaging}. "
+                "Click the image to read ODMR."
             )
         except Exception as exc:  # surface hardware errors instead of freezing silently
             print(f"ODMR sweep failed: {exc}")
@@ -294,6 +336,17 @@ class OdmrApp:
             self._sweeping = False
             self.btn_sweep.label.set_text("Run sweep")
             self.fig.canvas.draw_idle()
+
+    def _adopt_result(self, result) -> None:
+        """Install a freshly measured or loaded result as the current data."""
+        self.frequencies_mhz = result.frequencies_mhz
+        self.cube = result.cube
+        self.sem = result.sem
+        self.counts = result.counts
+        self.repeats_completed = result.repeats_completed
+        self._contrast = contrast_map(self.cube, self.min_signal_fraction)
+        self._view_mode = "pl"
+        self._refresh_image_view()
 
     # -------------------------------------------------- MW on/off diagnostic check
 
@@ -430,6 +483,18 @@ class OdmrApp:
             y_center=int(round(event.ydata)),
             half_size=self.roi_half_size,
         )
+        self._last_roi = roi
+        self._draw_roi(roi)
+        self._plot_spectrum(roi)
+
+    def _on_roi_size_changed(self, value) -> None:
+        """Resize the ROI and re-read the spectrum from the existing datacube."""
+        self.roi_half_size = int(value)
+        self.config["roi"]["half_size_px"] = self.roi_half_size
+        if self.cube is None or self._last_roi is None:
+            return
+        roi = Roi(self._last_roi.x_center, self._last_roi.y_center, self.roi_half_size)
+        self._last_roi = roi
         self._draw_roi(roi)
         self._plot_spectrum(roi)
 
@@ -445,19 +510,49 @@ class OdmrApp:
 
     def _plot_spectrum(self, roi: Roi) -> None:
         raw = roi_spectrum(self.cube, roi)
-        normalised = normalize_spectrum(raw, reference="max")
+        reference = float(np.max(raw))
+        if reference <= 0:
+            self._set_status("ROI has no signal.")
+            return
+        normalised = 100.0 * raw / reference
 
         self.spectrum_line.set_data(self.frequencies_mhz, normalised)
+
+        # Error band from the scatter between repeats, normalised the same
+        # way as the spectrum so the two are on one axis.
+        if self._error_band is not None:
+            self._error_band.remove()
+            self._error_band = None
+        error = roi_spectrum_error(self.sem, roi)
+        if error is not None and np.any(np.isfinite(error)):
+            error_pct = 100.0 * error / reference
+            self._error_band = self.ax_spec.fill_between(
+                self.frequencies_mhz,
+                normalised - error_pct,
+                normalised + error_pct,
+                color="tab:blue",
+                alpha=0.25,
+                linewidth=0,
+            )
+
         self.ax_spec.relim()
         self.ax_spec.autoscale_view()
-        self.ax_spec.set_title(f"ODMR at pixel ({roi.x_center}, {roi.y_center})")
+        n_pixels = (2 * roi.half_size + 1) ** 2
+        self.ax_spec.set_title(
+            f"ODMR at pixel ({roi.x_center}, {roi.y_center}) — "
+            f"{n_pixels} px averaged, {self.repeats_completed} repeat(s)"
+        )
 
         dip_freq = float(self.frequencies_mhz[int(np.argmin(normalised))])
         contrast_pct = 100.0 - float(np.min(normalised))
-        self._set_status(
-            f"ROI ({roi.x_center}, {roi.y_center}): deepest dip {dip_freq:.1f} MHz, "
-            f"contrast {contrast_pct:.2f} %"
+        message = (
+            f"ROI ({roi.x_center}, {roi.y_center}) ±{roi.half_size} px: "
+            f"deepest dip {dip_freq:.1f} MHz, contrast {contrast_pct:.2f} %"
         )
+        if error is not None and np.any(np.isfinite(error)):
+            typical_error = 100.0 * float(np.nanmedian(error)) / reference
+            message += f", error ±{typical_error:.3f} %"
+        self._set_status(message)
         self.fig.canvas.draw_idle()
 
     # --------------------------------------------------------------- save / load
@@ -471,12 +566,17 @@ class OdmrApp:
         path = os.path.join(out_dir, f"odmr_{datetime.now():%Y%m%d_%H%M%S}.npz")
         save_cube(
             path,
-            self.frequencies_mhz,
-            self.cube,
+            OdmrResult(
+                frequencies_mhz=self.frequencies_mhz,
+                cube=self.cube,
+                counts=self.counts,
+                sem=self.sem,
+                repeats_completed=self.repeats_completed,
+            ),
             metadata={
                 "binning": self.binning,
                 "power_dbm": self.mw_cfg["power_dbm"],
-                "exposure_ms": self.config["camera"]["exposure_ms"],
+                "exposure_ms": self.exposure_ms,
                 "frames_per_point": self.sweep_cfg["frames_per_point"],
             },
         )
@@ -484,12 +584,14 @@ class OdmrApp:
         self._set_status(f"Saved to {path}")
 
     def _load_measurement(self, path: str) -> None:
-        self.frequencies_mhz, self.cube, metadata = load_cube(path)
+        result, metadata = load_cube(path)
         self.binning = int(metadata.get("binning", self.binning))
-        self._contrast = contrast_map(self.cube, self.min_signal_fraction)
-        self._refresh_image_view()
+        self._adopt_result(result)
         self._set_status(f"Loaded {path} — click the image to read ODMR.")
-        print(f"Loaded {path}: {self.cube.shape[0]} frequency points, metadata={metadata}")
+        print(
+            f"Loaded {path}: {self.cube.shape[0]} frequency points, "
+            f"{result.repeats_completed} repeat(s), metadata={metadata}"
+        )
 
     # ------------------------------------------------------------------ teardown
 

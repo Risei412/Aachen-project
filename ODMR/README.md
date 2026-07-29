@@ -47,7 +47,10 @@ and you can probe as many points as you like from one measurement.
    so far.
 4. When the sweep finishes the image is displayed. **Click anywhere on it**
    to plot that spot's ODMR spectrum in the right-hand panel. The status
-   line reports the deepest dip frequency and the contrast.
+   line reports the deepest dip frequency and the contrast. Drag the
+   **ROI ±px** slider to resize the averaging window; it re-reads the
+   datacube already in memory, so exploring ROI sizes after a sweep is
+   instant and costs no measurement time.
 5. **"View"** cycles the left panel through the mean photoluminescence
    image, the per-pixel ODMR contrast map, and the MW-check difference map
    (whichever are available). The contrast map shows where the microwave
@@ -56,6 +59,37 @@ and you can probe as many points as you like from one measurement.
 6. **"Save"** writes the datacube to `data/odmr_<timestamp>.npz`. Re-open it
    later with `python odmr_app.py --load data/odmr_....npz` to keep clicking
    around the data with no hardware attached.
+
+## Repeated sweeps and error bars
+
+Set `sweep.repeats` to average several full sweeps. Noise falls as
+√repeats while total time grows linearly, so 4 repeats halves the noise
+and 16 repeats quarters it.
+
+Two details make the averaging trustworthy:
+
+**Alternating sweep direction** (`sweep.alternate_direction`, on by
+default) runs every second repeat from high to low frequency. Without it,
+any slow drift — laser power wandering, NV bleaching, the sample creeping
+under pressure — correlates with frequency, because frequency is always
+visited in the same time order. A steadily dimming sample would tilt the
+whole spectrum and could be mistaken for, or could hide, a real
+resonance. Alternating makes the drift symmetric about the middle of the
+sweep so averaging largely cancels it instead of baking it into the
+lineshape.
+
+**Error bars** (`sweep.estimate_errors`) come from the scatter *between*
+repeats, not from a noise model, so they reflect whatever is actually
+fluctuating in your setup. The shaded band around the spectrum is ±1
+standard error, and the status line reports the typical value. This is the
+only way to tell a shallow real dip from a noise excursion. It doubles the
+memory used while acquiring (a sum-of-squares accumulator alongside the
+sum) and does nothing when `repeats` is 1, since one measurement has no
+scatter.
+
+Aborting mid-way is safe: each frequency point is divided by the number of
+times it was actually measured, and points never reached are dropped. The
+status line says so when the repeats came out uneven.
 
 ## "MW check" — is anything actually working?
 
@@ -190,7 +224,10 @@ Sweep time is roughly
 | `camera.binning` | Cuts datacube size by N² and raises per-pixel SNR. |
 | `camera.exposure_ms` | Starting exposure; adjust live with the GUI slider. Longer collects more photons (better SNR) but slows the sweep and risks saturation. |
 | `camera.exposure_limits_ms` | Range of the exposure slider. The camera clamps to its own hardware limits anyway. |
-| `roi.half_size_px` | Larger ROI averages more pixels (smoother spectrum) but blurs spatial detail. |
+| `roi.half_size_px` | Starting ROI size; adjust live with the slider. Larger averages more pixels — smoother spectrum and tighter error bars (errors add in quadrature) — but blurs spatial detail. |
+| `sweep.repeats` | Sweeps averaged together. Noise falls as √repeats, time grows linearly. |
+| `sweep.alternate_direction` | Reverses every 2nd repeat so slow drift cancels instead of tilting the lineshape. |
+| `sweep.estimate_errors` | Error bars from between-repeat scatter. Doubles acquisition memory; no effect at `repeats: 1`. |
 | `diagnostic.check_freq_mhz` | Frequency the "MW check" parks at. Must be a real resonance or the check correctly reports nothing. Ignored once a sweep has run. |
 | `diagnostic.cycles` | Interleaved off/on pairs averaged by the MW check; more cycles = lower noise floor. |
 | `diagnostic.settle_ms` | Wait after each RF switch during the MW check. Set at least as long as `camera.exposure_ms`. |
