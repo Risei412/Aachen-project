@@ -5,7 +5,7 @@
 mock: true            # true = run with simulated camera/generator (no hardware needed)
 
 camera:
-  exposure_ms: 20.0    # camera exposure time per frame, in milliseconds.
+  exposure_ms: 50.0    # camera exposure time per frame, in milliseconds.
                        # Adjustable live from the GUI slider; this is the
                        # starting value. Watch the "% saturated" readout in
                        # the live-view title: saturated pixels are clipped and
@@ -25,14 +25,24 @@ microwave:
   port: "COM7"         # Windows: COMx. Linux: /dev/ttyACM0 or /dev/ttyUSB0
   channel: 0           # 0 = channel A, 1 = channel B
   power_dbm: 0.0        # RF power sent to the MW antenna/loop near the sample
+  freq_limits_mhz: [54.0, 13600.0]   # generator's tuning range, used to reject
+                        # out-of-range sweep entries typed into the GUI.
+                        # SynthHD is 54 MHz - 13.6 GHz; SynthHD PRO is 10 MHz - 15 GHz.
+                        # Check your unit and adjust.
 
 sweep:
   start_mhz: 2800.0     # start frequency of the ODMR sweep
   stop_mhz: 2940.0      # stop frequency of the ODMR sweep
   step_mhz: 1.0          # frequency step size
-  settle_ms: 5.0          # wait time after setting frequency, before capturing a frame
-  frames_per_point: 3     # frames averaged at each frequency (reduces shot noise)
-  repeats: 1              # how many times to repeat the whole sweep and average.
+  settle_ms: 30.0         # wait after setting frequency, before capturing a frame.
+                          # Set >= exposure_ms so the PLL has locked and the next
+                          # exposure starts cleanly at the new frequency.
+  frames_per_point: 5     # frames averaged at each frequency (reduces shot noise)
+  discard_frames: 1       # frames thrown away right after each frequency change.
+                          # A free-running camera may already be mid-exposure when
+                          # the frequency changes, so that frame straddles two
+                          # frequencies and blurs adjacent points together.
+  repeats: 6              # how many times to repeat the whole sweep and average.
                           # SNR improves as sqrt(repeats); total time scales linearly.
   alternate_direction: true   # run every 2nd repeat high->low. Slow drift (laser
                           # power, NV bleaching, sample creep) otherwise correlates
@@ -44,7 +54,7 @@ sweep:
                           # used while acquiring. No effect when repeats is 1.
 
 roi:
-  half_size_px: 8       # clicked point +/- this many (binned) pixels is averaged
+  half_size_px: 15      # clicked point +/- this many (binned) pixels is averaged
                         # into the displayed ODMR spectrum. Adjustable live from the
                         # GUI slider; it re-reads the existing datacube, so changing
                         # it after a sweep costs nothing.
@@ -54,6 +64,17 @@ analysis:
   min_signal_fraction: 0.15   # contrast-map threshold: pixels dimmer than this
                               # fraction of the brightest pixel are blanked, so
                               # shot noise in dark areas doesn't swamp the scale
+  baseline_correction: true   # normalise the spectrum against a robustly fitted
+                              # straight line rather than the single brightest
+                              # point (where one upward noise spike would define
+                              # 100 % and inflate the apparent contrast). Also
+                              # removes linear baseline tilt left by slow drift.
+                              # The fit iteratively rejects points lying below it,
+                              # one-sided because a resonance can only darken the
+                              # PL, so it finds the off-resonance level wherever
+                              # the dips happen to sit in the sweep.
+  baseline_reject_sigma: 2.5  # reject points this many robust sigma BELOW the fit
+  baseline_iterations: 8      # max refit iterations
 
 diagnostic:                   # settings for the "MW check" button (quick NV response test)
   check_freq_mhz: 2870.0      # frequency to park the MW at. Use a KNOWN resonance:
@@ -62,8 +83,13 @@ diagnostic:                   # settings for the "MW check" button (quick NV res
                               # use one of the split dip frequencies instead. Once a
                               # sweep has run, the app ignores this and uses the
                               # deepest dip it actually measured.
-  cycles: 10                  # interleaved off/on pairs to average
+  cycles: 50                  # interleaved OFF-ON-ON-OFF (ABBA) cycles to average
+  discard_frames: 1           # frames discarded after each RF switch
   settle_ms: 30.0             # wait after each RF switch; set >= camera exposure_ms
 
 output:
-  directory: "data"     # where "Save" writes the .npz datacubes
+  directory: "data"            # "Save raw" writes full .npz datacubes here.
+                               # Git-ignored: a sweep is hundreds of MB.
+  results_directory: "results" # "Export" writes small publishable bundles here
+                               # (metadata, spectra CSV, plots, maps). These ARE
+                               # tracked by git -- push them with publish_results.py

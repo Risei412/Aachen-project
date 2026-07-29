@@ -1,0 +1,17 @@
+{
+    // Matplotlib windows need a real GUI backend; the integrated terminal
+    // provides one. Interactive mode is not used, so plt.show() blocks as
+    // intended and keeps the live view running.
+    "python.terminal.activateEnvInCurrentTerminal": true,
+    "terminal.integrated.cwd": "${workspaceFolder}",
+    "files.exclude": {
+        "**/__pycache__": true
+    },
+    "[python]": {
+        "editor.rulers": [88]
+    },
+    "yaml.schemas": {},
+    "search.exclude": {
+        "ODMR/data": true
+    }
+}

@@ -1,5 +1,9 @@
 __pycache__/
 *.pyc
 .venv/
-data/
+
+# Raw ODMR datacubes: hundreds of MB per sweep, far too large for git.
+# Publish the compact bundles in ODMR/results/ instead (see publish_results.py).
+ODMR/data/
 *.npz
+!ODMR/results/**/*.npz

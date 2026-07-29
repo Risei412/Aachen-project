@@ -38,7 +38,7 @@ import numpy as np
 import yaml
 from matplotlib import pyplot as plt
 from matplotlib.patches import Rectangle
-from matplotlib.widgets import Button, Slider
+from matplotlib.widgets import Button, Slider, TextBox
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "Equipments", "CMOS camera"))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "Equipments", "Microwave generator"))
@@ -59,6 +59,7 @@ from odmr_sweep import (  # noqa: E402
     save_cube,
     summarize_difference,
 )
+from export_results import export_measurement  # noqa: E402
 from thorlabs_camera import MockThorlabsCamera, ThorlabsCamera  # noqa: E402
 from synthhd import MockSynthHD, SynthHD  # noqa: E402
 
@@ -77,10 +78,16 @@ class OdmrApp:
         self.roi_half_size = int(config["roi"]["half_size_px"])
         roi_limits = config["roi"].get("half_size_limits", [1, 60])
         self.roi_half_size_limits = (int(roi_limits[0]), int(roi_limits[1]))
-        self.min_signal_fraction = float(
-            config.get("analysis", {}).get("min_signal_fraction", 0.15)
-        )
+        analysis_cfg = config.get("analysis", {}) or {}
+        self.min_signal_fraction = float(analysis_cfg.get("min_signal_fraction", 0.15))
+        self.baseline_correction = bool(analysis_cfg.get("baseline_correction", True))
+        self.baseline_reject_sigma = float(analysis_cfg.get("baseline_reject_sigma", 2.5))
+        self.baseline_iterations = int(analysis_cfg.get("baseline_iterations", 8))
         self.diag_cfg = config.get("diagnostic", {}) or {}
+        freq_limits = config["microwave"].get("freq_limits_mhz", [54.0, 13600.0])
+        self.freq_limits_mhz = (float(freq_limits[0]), float(freq_limits[1]))
+        self._updating_params = False
+        self._frame_shape: tuple[int, int] | None = None
         self.exposure_ms = float(config["camera"]["exposure_ms"])
         limits = config["camera"].get("exposure_limits_ms", [0.05, 1000.0])
         self.exposure_limits_ms = (float(limits[0]), float(limits[1]))
@@ -136,7 +143,7 @@ class OdmrApp:
     def _build_figure(self) -> None:
         self.fig, (self.ax_img, self.ax_spec) = plt.subplots(1, 2, figsize=(13, 5.5))
         self.fig.canvas.manager.set_window_title("Widefield ODMR viewer")
-        self.fig.subplots_adjust(bottom=0.24, wspace=0.25)
+        self.fig.subplots_adjust(bottom=0.30, wspace=0.25)
 
         placeholder = np.zeros((10, 10))
         self.im = self.ax_img.imshow(placeholder, cmap="gray", origin="upper")
@@ -150,21 +157,40 @@ class OdmrApp:
         self.ax_spec.set_title("ODMR spectrum — run a sweep, then click the image")
         self.ax_spec.grid(True, alpha=0.3)
 
-        self.btn_sweep = Button(self.fig.add_axes([0.06, 0.03, 0.12, 0.06]), "Run sweep")
+        self.btn_sweep = Button(self.fig.add_axes([0.045, 0.03, 0.105, 0.06]), "Run sweep")
         self.btn_sweep.on_clicked(self._on_sweep_clicked)
-        self.btn_mwcheck = Button(self.fig.add_axes([0.19, 0.03, 0.12, 0.06]), "MW check")
+        self.btn_mwcheck = Button(self.fig.add_axes([0.16, 0.03, 0.105, 0.06]), "MW check")
         self.btn_mwcheck.on_clicked(self._on_mwcheck_clicked)
-        self.btn_view = Button(self.fig.add_axes([0.32, 0.03, 0.14, 0.06]), "View: PL")
+        self.btn_view = Button(self.fig.add_axes([0.275, 0.03, 0.125, 0.06]), "View: PL")
         self.btn_view.on_clicked(self._on_view_clicked)
-        self.btn_save = Button(self.fig.add_axes([0.47, 0.03, 0.10, 0.06]), "Save")
+        self.btn_save = Button(self.fig.add_axes([0.41, 0.03, 0.085, 0.06]), "Save raw")
         self.btn_save.on_clicked(self._on_save_clicked)
+        self.btn_export = Button(self.fig.add_axes([0.505, 0.03, 0.085, 0.06]), "Export")
+        self.btn_export.on_clicked(self._on_export_clicked)
+
+        # Sweep parameters are editable before the run rather than only via
+        # config.yaml, so the range can be narrowed onto a resonance found by
+        # a previous sweep without restarting the app.
+        self.param_boxes = {}
+        specs = [
+            ("start_mhz", "Start MHz", [0.080, 0.175, 0.070, 0.042]),
+            ("stop_mhz", "Stop", [0.205, 0.175, 0.070, 0.042]),
+            ("step_mhz", "Step", [0.320, 0.175, 0.050, 0.042]),
+            ("repeats", "Repeats", [0.440, 0.175, 0.040, 0.042]),
+        ]
+        for key, label, rect in specs:
+            box = TextBox(self.fig.add_axes(rect), label, initial=self._param_text(key))
+            box.on_submit(lambda text, k=key: self._on_param_submit(k, text))
+            self.param_boxes[key] = box
+
+        self.plan_text = self.fig.text(0.53, 0.196, "", fontsize=8.5, va="center")
 
         # Exposure is set on a logarithmic scale: usable values span three
         # decades (a bright reflection needs tens of microseconds, a dim NV
         # ensemble hundreds of milliseconds), which a linear slider cannot
         # resolve at both ends.
         self.slider_exposure = Slider(
-            self.fig.add_axes([0.09, 0.13, 0.28, 0.025]),
+            self.fig.add_axes([0.09, 0.115, 0.28, 0.022]),
             "Exposure",
             np.log10(self.exposure_limits_ms[0]),
             np.log10(self.exposure_limits_ms[1]),
@@ -176,7 +202,7 @@ class OdmrApp:
         # ROI size is re-applied to the already-measured datacube, so it can
         # be explored freely after the sweep without re-acquiring anything.
         self.slider_roi = Slider(
-            self.fig.add_axes([0.56, 0.13, 0.28, 0.025]),
+            self.fig.add_axes([0.56, 0.115, 0.28, 0.022]),
             "ROI ±px",
             self.roi_half_size_limits[0],
             self.roi_half_size_limits[1],
@@ -185,7 +211,8 @@ class OdmrApp:
         )
         self.slider_roi.on_changed(self._on_roi_size_changed)
 
-        self.status = self.fig.text(0.59, 0.06, "", fontsize=8.5, va="center")
+        self.status = self.fig.text(0.605, 0.06, "", fontsize=8, va="center")
+        self._update_plan()
 
         self.fig.canvas.mpl_connect("button_press_event", self._on_click)
         self.fig.canvas.mpl_connect("close_event", self._on_close)
@@ -201,6 +228,111 @@ class OdmrApp:
         self.ax_img.set_xlim(-0.5, image.shape[1] - 0.5)
         self.ax_img.set_ylim(image.shape[0] - 0.5, -0.5)
         self.ax_img.set_title(title)
+        self.fig.canvas.draw_idle()
+
+    # --------------------------------------------------------- sweep parameters
+
+    def _param_text(self, key: str) -> str:
+        value = self.sweep_cfg.get(key, 1)
+        return str(int(value)) if key == "repeats" else f"{float(value):g}"
+
+    def _validate_params(self, start, stop, step, repeats) -> str | None:
+        """Return a human-readable reason the plan is invalid, or None if OK."""
+        low, high = self.freq_limits_mhz
+        if step <= 0:
+            return "Step must be greater than 0."
+        if stop <= start:
+            return "Stop must be greater than Start."
+        if repeats < 1:
+            return "Repeats must be at least 1."
+        if start < low or stop > high:
+            return f"Frequencies must lie within {low:g}-{high:g} MHz (generator range)."
+        if (stop - start) / step > 20000:
+            return "Too many points; increase Step or narrow the range."
+        return None
+
+    def _on_param_submit(self, key: str, text: str) -> None:
+        if self._updating_params:
+            return
+        if self._sweeping:
+            self._revert_param(key)
+            self._set_status("Cannot change sweep parameters while a sweep is running.")
+            return
+
+        try:
+            value = int(float(text)) if key == "repeats" else float(text)
+        except ValueError:
+            self._revert_param(key)
+            self._set_status(f"'{text}' is not a number.")
+            return
+
+        candidate = {
+            "start_mhz": float(self.sweep_cfg["start_mhz"]),
+            "stop_mhz": float(self.sweep_cfg["stop_mhz"]),
+            "step_mhz": float(self.sweep_cfg["step_mhz"]),
+            "repeats": int(self.sweep_cfg.get("repeats", 1)),
+        }
+        candidate[key] = value
+
+        problem = self._validate_params(**{k.replace("_mhz", ""): v for k, v in candidate.items()})
+        if problem:
+            self._revert_param(key)
+            self._set_status(problem)
+            return
+
+        self.sweep_cfg[key] = value
+        # Echo back the canonical form ("2850.0" -> "2850"), so the boxes
+        # always show exactly what the sweep will use.
+        self._revert_param(key)
+        self._update_plan()
+        self._set_status("Sweep plan updated.")
+
+    def _revert_param(self, key: str) -> None:
+        """Restore a text box to the last accepted value without re-triggering."""
+        self._updating_params = True
+        try:
+            self.param_boxes[key].set_val(self._param_text(key))
+        finally:
+            self._updating_params = False
+        self._frame_shape: tuple[int, int] | None = None
+
+    def _update_plan(self) -> None:
+        """Show what the current settings commit to, before the run starts."""
+        start = float(self.sweep_cfg["start_mhz"])
+        stop = float(self.sweep_cfg["stop_mhz"])
+        step = float(self.sweep_cfg["step_mhz"])
+        repeats = int(self.sweep_cfg.get("repeats", 1))
+        n_points = int(round((stop - start) / step)) + 1
+
+        # Discarded frames still cost an exposure each, so they belong in the
+        # time estimate even though they never reach the datacube.
+        frames = int(self.sweep_cfg.get("frames_per_point", 1))
+        discarded = int(self.sweep_cfg.get("discard_frames", 1))
+        settle = float(self.sweep_cfg.get("settle_ms", 0.0))
+        seconds = n_points * repeats * (settle + (frames + discarded) * self.exposure_ms) / 1000.0
+
+        # Frame shape is cached rather than re-grabbed: this runs on every
+        # keystroke-submit, and pulling a frame from the camera each time
+        # would contend with the live view for the acquisition queue.
+        if self._frame_shape is None and self.camera is not None:
+            try:
+                self._frame_shape = self.camera.get_frame().shape[:2]
+            except Exception:
+                self._frame_shape = None
+
+        megabytes = 0.0
+        if self._frame_shape is not None:
+            megabytes = estimate_cube_bytes(
+                n_points, self._frame_shape[0], self._frame_shape[1], self.binning
+            ) / 1e6
+            if self.sweep_cfg.get("estimate_errors", True) and repeats > 1:
+                megabytes *= 2  # sum-of-squares accumulator runs alongside the sum
+
+        duration = f"{seconds:.0f} s" if seconds < 120 else f"{seconds / 60:.1f} min"
+        text = f"→ {n_points} points × {repeats} = {n_points * repeats} frames, ~{duration}"
+        if megabytes:
+            text += f", ~{megabytes:.0f} MB"
+        self.plan_text.set_text(text)
         self.fig.canvas.draw_idle()
 
     # ----------------------------------------------------------------- exposure
@@ -227,6 +359,7 @@ class OdmrApp:
         self.exposure_ms = float(applied) if applied else requested
         self.config["camera"]["exposure_ms"] = self.exposure_ms
         self._update_exposure_label(self.exposure_ms)
+        self._update_plan()
 
     def _saturation_report(self, frame: np.ndarray) -> str:
         """Fraction of pixels at (or within 1 % of) full well.
@@ -311,6 +444,7 @@ class OdmrApp:
                 power_dbm=self.mw_cfg["power_dbm"],
                 settle_ms=self.sweep_cfg["settle_ms"],
                 frames_per_point=self.sweep_cfg["frames_per_point"],
+                discard_frames=int(self.sweep_cfg.get("discard_frames", 1)),
                 binning=self.binning,
                 repeats=repeats,
                 alternate_direction=bool(self.sweep_cfg.get("alternate_direction", True)),
@@ -396,6 +530,7 @@ class OdmrApp:
                 power_dbm=self.mw_cfg["power_dbm"],
                 n_cycles=n_cycles,
                 settle_ms=float(self.diag_cfg.get("settle_ms", 30.0)),
+                discard_frames=int(self.diag_cfg.get("discard_frames", 1)),
                 binning=self.binning,
                 on_progress=on_progress,
                 should_abort=lambda: self._abort,
@@ -508,24 +643,78 @@ class OdmrApp:
         )
         self.ax_img.add_patch(self.roi_patch)
 
+    def _spectrum_baseline(self, raw: np.ndarray) -> np.ndarray:
+        """Off-resonance baseline the spectrum is normalised against.
+
+        Dividing by the single brightest point (the obvious choice) is
+        fragile: one upward noise spike then defines 100 %, pushing the
+        whole curve down and inflating the apparent contrast. It also
+        leaves any linear baseline tilt from slow drift in the lineshape.
+
+        So fit a straight line instead -- but fit it *robustly*. Fitting
+        the two ends of the sweep only works if the resonances happen to
+        sit in the middle; with the default 2800-2940 MHz range and NV
+        resonances near 2820/2920 the dips fall inside the end windows,
+        drag the fit down, and the contrast comes out badly under-reported.
+
+        Instead fit all points and iteratively reject those lying well
+        *below* the fit. Rejection is one-sided because an ODMR resonance
+        can only darken the photoluminescence: downward outliers are
+        signal, upward ones are noise. The scale is set by the median
+        absolute deviation, which the dips cannot inflate as long as they
+        occupy a minority of the sweep. The fit therefore converges onto
+        the off-resonance baseline wherever the resonances happen to lie.
+        """
+        n = len(raw)
+        fallback = np.full(n, float(np.max(raw)))
+        if not self.baseline_correction or n < 5:
+            return fallback
+
+        x = np.asarray(self.frequencies_mhz, dtype=float)
+        mask = np.ones(n, dtype=bool)
+        baseline = fallback
+        for _ in range(self.baseline_iterations):
+            if mask.sum() < max(4, int(0.2 * n)):
+                break  # too few points left to trust the fit
+            try:
+                coefficients = np.polyfit(x[mask], raw[mask], 1)
+            except (np.linalg.LinAlgError, ValueError):
+                return fallback
+            baseline = np.polyval(coefficients, x)
+
+            residual = raw - baseline
+            spread = 1.4826 * float(np.median(np.abs(residual - np.median(residual))))
+            if spread <= 0:
+                break
+            keep = residual > -self.baseline_reject_sigma * spread
+            if np.array_equal(keep, mask):
+                break
+            mask = keep
+
+        if not np.all(np.isfinite(baseline)) or np.any(baseline <= 0):
+            return fallback
+        return baseline
+
     def _plot_spectrum(self, roi: Roi) -> None:
         raw = roi_spectrum(self.cube, roi)
-        reference = float(np.max(raw))
-        if reference <= 0:
+        if float(np.max(raw)) <= 0:
             self._set_status("ROI has no signal.")
             return
-        normalised = 100.0 * raw / reference
+
+        baseline = self._spectrum_baseline(raw)
+        normalised = 100.0 * raw / baseline
 
         self.spectrum_line.set_data(self.frequencies_mhz, normalised)
 
-        # Error band from the scatter between repeats, normalised the same
-        # way as the spectrum so the two are on one axis.
+        # Error band from the scatter between repeats, divided by the same
+        # per-point baseline as the spectrum so both share one axis.
         if self._error_band is not None:
             self._error_band.remove()
             self._error_band = None
         error = roi_spectrum_error(self.sem, roi)
-        if error is not None and np.any(np.isfinite(error)):
-            error_pct = 100.0 * error / reference
+        has_error = error is not None and np.any(np.isfinite(error))
+        if has_error:
+            error_pct = 100.0 * error / baseline
             self._error_band = self.ax_spec.fill_between(
                 self.frequencies_mhz,
                 normalised - error_pct,
@@ -539,19 +728,25 @@ class OdmrApp:
         self.ax_spec.autoscale_view()
         n_pixels = (2 * roi.half_size + 1) ** 2
         self.ax_spec.set_title(
-            f"ODMR at pixel ({roi.x_center}, {roi.y_center}) — "
+            f"ODMR ROI centred at ({roi.x_center}, {roi.y_center}) — "
             f"{n_pixels} px averaged, {self.repeats_completed} repeat(s)"
         )
 
-        dip_freq = float(self.frequencies_mhz[int(np.argmin(normalised))])
-        contrast_pct = 100.0 - float(np.min(normalised))
+        dip_index = int(np.argmin(normalised))
+        dip_freq = float(self.frequencies_mhz[dip_index])
+        contrast_pct = 100.0 - float(normalised[dip_index])
         message = (
             f"ROI ({roi.x_center}, {roi.y_center}) ±{roi.half_size} px: "
             f"deepest dip {dip_freq:.1f} MHz, contrast {contrast_pct:.2f} %"
         )
-        if error is not None and np.any(np.isfinite(error)):
-            typical_error = 100.0 * float(np.nanmedian(error)) / reference
+        if has_error:
+            typical_error = float(np.nanmedian(100.0 * error / baseline))
             message += f", error ±{typical_error:.3f} %"
+            # A dip smaller than a few times its own error bar is not a
+            # measurement, it is a fluctuation -- say so rather than letting
+            # the number stand on its own.
+            if typical_error > 0 and contrast_pct < 3.0 * typical_error:
+                message += " (below 3x error — not significant)"
         self._set_status(message)
         self.fig.canvas.draw_idle()
 
@@ -582,6 +777,45 @@ class OdmrApp:
         )
         print(f"Saved datacube to {path}")
         self._set_status(f"Saved to {path}")
+
+    def _on_export_clicked(self, event) -> None:
+        """Write a small, publishable bundle (not the raw cube) for git."""
+        if self.cube is None:
+            self._set_status("Nothing to export — run a sweep first.")
+            return
+
+        rois = [self._last_roi] if self._last_roi is not None else [
+            Roi(self.cube.shape[2] // 2, self.cube.shape[1] // 2, self.roi_half_size)
+        ]
+        baselines = [self._spectrum_baseline(roi_spectrum(self.cube, roi)) for roi in rois]
+
+        results_root = self.config.get("output", {}).get(
+            "results_directory", os.path.join(os.path.dirname(__file__), "results")
+        )
+        try:
+            out_dir = export_measurement(
+                results_root,
+                OdmrResult(
+                    frequencies_mhz=self.frequencies_mhz,
+                    cube=self.cube,
+                    counts=self.counts,
+                    sem=self.sem,
+                    repeats_completed=self.repeats_completed,
+                ),
+                config=self.config,
+                rois=rois,
+                baselines=baselines,
+                min_signal_fraction=self.min_signal_fraction,
+            )
+        except Exception as exc:
+            print(f"Export failed: {exc}")
+            self._set_status(f"Export failed: {exc}")
+            return
+
+        relative = os.path.relpath(out_dir, os.path.dirname(__file__))
+        print(f"Exported results to {out_dir}")
+        print("Publish with:  python publish_results.py")
+        self._set_status(f"Exported to {relative} — run publish_results.py to push.")
 
     def _load_measurement(self, path: str) -> None:
         result, metadata = load_cube(path)

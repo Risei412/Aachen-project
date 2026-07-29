@@ -40,25 +40,101 @@ and you can probe as many points as you like from one measurement.
    contrast at all, no matter how good the rest of the setup is. Exposure is
    locked during a sweep, since changing it mid-sweep would make the
    datacube's frequency points incomparable.
-2. Press **"MW check"** first (see below) to confirm the NV centers are
-   actually responding, before spending minutes on a full sweep.
-3. Press **"Run sweep"**. Progress is shown as the frequency advances; press
+2. Set the sweep in the **Start / Stop / Step / Repeats** boxes (press Enter
+   to apply each). The line beside them shows what you are committing to
+   before anything runs — number of points, total frames, estimated duration
+   and datacube size — so a range that would take an hour or exhaust memory
+   is visible up front rather than discovered halfway through. Entries are
+   validated against the generator's tuning range
+   (`microwave.freq_limits_mhz`) and rejected with a reason if the stop is
+   below the start, the step is non-positive, or the plan is absurdly large;
+   a rejected box snaps back to its last accepted value. `config.yaml` still
+   supplies the starting values.
+3. Press **"MW check"** (see below) to confirm the NV centers are actually
+   responding, before spending minutes on a full sweep.
+4. Press **"Run sweep"**. Progress is shown as the frequency advances; press
    the same button (now "Abort") to stop early and keep the points measured
-   so far.
-4. When the sweep finishes the image is displayed. **Click anywhere on it**
+   so far. Sweep parameters are locked while it runs.
+5. When the sweep finishes the image is displayed. **Click anywhere on it**
    to plot that spot's ODMR spectrum in the right-hand panel. The status
    line reports the deepest dip frequency and the contrast. Drag the
    **ROI ±px** slider to resize the averaging window; it re-reads the
    datacube already in memory, so exploring ROI sizes after a sweep is
    instant and costs no measurement time.
-5. **"View"** cycles the left panel through the mean photoluminescence
+6. **"View"** cycles the left panel through the mean photoluminescence
    image, the per-pixel ODMR contrast map, and the MW-check difference map
    (whichever are available). The contrast map shows where the microwave
    actually modulates the PL, i.e. where the NV centers are — useful for
    finding the NV layer before picking readout spots.
-6. **"Save"** writes the datacube to `data/odmr_<timestamp>.npz`. Re-open it
-   later with `python odmr_app.py --load data/odmr_....npz` to keep clicking
-   around the data with no hardware attached.
+7. **"Save raw"** writes the full datacube to `data/odmr_<timestamp>.npz`.
+   Re-open it later with `python odmr_app.py --load data/odmr_....npz` to keep
+   clicking around the data with no hardware attached. These files are large
+   and stay local (git-ignored).
+8. **"Export"** writes a small, shareable bundle to
+   `results/<timestamp>/` — see *Publishing results* below.
+
+## Running it in VS Code
+
+Open the repository folder in VS Code (**File > Open Folder**, choose the
+`Aachen-project` folder — not `ODMR/` on its own, since the app loads the
+instrument drivers from `../Equipments/`).
+
+1. Accept the recommended extensions when prompted (Python, Pylance).
+2. Select the interpreter: **Ctrl+Shift+P** → *Python: Select Interpreter*.
+   Point it at the virtual environment you installed the requirements into.
+3. Install dependencies: **Ctrl+Shift+P** → *Tasks: Run Task* →
+   **ODMR: install Python dependencies**.
+4. Press **F5** and pick a configuration:
+
+| Configuration | What it does |
+| --- | --- |
+| ODMR: real hardware (camera + SynthHD) | Runs against the Thorlabs camera and COM port in `config.yaml` |
+| ODMR: simulated hardware | Runs with mocks, no instruments needed |
+| ODMR: re-open a saved datacube | Prompts for an `.npz` and opens it for analysis |
+| ODMR: publish results (dry run) | Shows what would be pushed, changes nothing |
+
+The plot window needs a real GUI, so all configurations run in the
+integrated terminal rather than the debug console.
+
+## Publishing results to GitHub
+
+Raw datacubes cannot go into version control: one sweep is hundreds of
+megabytes, GitHub warns above 50 MB per file and rejects above 100 MB, and
+a repository accumulating them becomes impractical to clone. So the split
+is deliberate:
+
+- **`ODMR/data/`** — full `.npz` datacubes from **"Save raw"**. Git-ignored,
+  stays on the acquisition machine.
+- **`ODMR/results/`** — compact bundles from **"Export"**. Tracked by git.
+
+Each exported bundle is about 1–2 MB and contains:
+
+| File | Contents |
+| --- | --- |
+| `metadata.json` | Every setting used, plus the **git commit** that produced the result (marked `-dirty` if the working tree had uncommitted changes), so a result can be traced to exact code and configuration |
+| `spectrum_x*_y*_r*.csv` | The ROI spectrum: frequency, raw counts, normalised %, fitted baseline, repeat count, error |
+| `spectrum.png` | Plotted spectrum with error band |
+| `maps.png` | Mean PL and ODMR contrast map, with the ROI marked |
+| `maps.npz` | Those two maps as float32 arrays, so the shared result carries real numbers and not only pictures |
+| `README.md` | Human-readable summary with a dip/contrast table |
+
+To publish, from `ODMR/`:
+
+```bash
+python publish_results.py --dry-run   # check what would be committed
+python publish_results.py             # commit + push the newest bundle
+python publish_results.py --all       # every unpublished bundle
+python publish_results.py -m "culet centre, 2 GPa"
+```
+
+or use **Tasks: Run Task** → *ODMR: publish results to GitHub*.
+
+This is a deliberate manual step, not something the acquisition GUI does on
+its own — pushing is outward-facing and should not happen as a side effect
+of pressing a button mid-experiment. The script refuses to commit any file
+over 100 MB (and warns above 50 MB) rather than letting the push fail after
+the commit is already made, and retries transient network failures with
+exponential backoff.
 
 ## Repeated sweeps and error bars
 
@@ -90,6 +166,58 @@ scatter.
 Aborting mid-way is safe: each frequency point is divided by the number of
 times it was actually measured, and points never reached are dropped. The
 status line says so when the repeats came out uneven.
+
+## Noise and systematics
+
+Several defaults exist specifically to keep slow drift and outliers out of
+the result. They cost measurement time, so they are all adjustable.
+
+**Discarded frames after each change** (`sweep.discard_frames`,
+`diagnostic.discard_frames`). A free-running camera can already be
+mid-exposure when the microwave frequency or RF state changes, so that
+frame straddles two conditions. Keeping it blurs adjacent frequency points
+together and adds comb-like structure to the noise floor. One discarded
+frame is usually enough; `sweep.settle_ms` should also be at least as long
+as the exposure.
+
+**ABBA ordering in the MW check.** Each cycle runs OFF-ON-ON-OFF rather
+than a plain OFF/ON pair. With a plain pair the two states sit a fixed time
+apart, so a *linear* drift biases every cycle identically and survives
+averaging as a false contrast. Under ABBA the mean acquisition time of the
+OFF frames equals that of the ON frames, so linear drift cancels within
+each cycle. Measured on a simulated camera whose laser decays 0.1 % per
+frame, with the microwave parked off resonance (true contrast exactly 0):
+
+| drift per frame | plain OFF/ON | ABBA |
+| --- | --- | --- |
+| 0 | +0.0009 % | +0.0004 % |
+| 0.02 % | +0.0407 % | +0.0004 % |
+| 0.05 % | +0.1021 % | +0.0005 % |
+| 0.10 % | +0.2054 % | +0.0008 % |
+
+A 0.2 % false contrast is easily mistaken for a weak real NV signal.
+
+**Robust baseline normalisation** (`analysis.baseline_correction`). The
+spectrum is divided by a straight line fitted to the off-resonance level,
+not by its single brightest point. Dividing by the maximum lets one upward
+noise spike define 100 %, and leaves any drift-induced tilt in the
+lineshape. The fit iteratively rejects points lying *below* it — one-sided,
+because a resonance can only darken the photoluminescence, so downward
+outliers are signal and upward ones are noise. That means it finds the
+baseline wherever the dips happen to sit, including near the ends of the
+sweep. (A fixed "fit the two ends" rule fails on the default 2800–2940 MHz
+range, since NV resonances near 2820/2920 land inside the end windows and
+drag the fit down.) Measured against a known 8.080 % contrast:
+
+| spectrum | divide-by-max | robust fit |
+| --- | --- | --- |
+| clean | +0.010 pp | −0.006 pp |
+| one +3 % noise spike | +1.684 pp | +0.120 pp |
+| 4 % linear tilt | +3.147 pp | −0.006 pp |
+
+**Significance flag.** When a dip is smaller than 3× its own error bar the
+status line says `(below 3x error — not significant)`, so a number is not
+quoted as a measurement when it is a fluctuation.
 
 ## "MW check" — is anything actually working?
 
@@ -225,9 +353,16 @@ Sweep time is roughly
 | `camera.exposure_ms` | Starting exposure; adjust live with the GUI slider. Longer collects more photons (better SNR) but slows the sweep and risks saturation. |
 | `camera.exposure_limits_ms` | Range of the exposure slider. The camera clamps to its own hardware limits anyway. |
 | `roi.half_size_px` | Starting ROI size; adjust live with the slider. Larger averages more pixels — smoother spectrum and tighter error bars (errors add in quadrature) — but blurs spatial detail. |
+| `sweep.start_mhz` / `stop_mhz` / `step_mhz` | Starting sweep range; editable live in the GUI. |
+| `microwave.freq_limits_mhz` | Generator tuning range used to validate GUI entries. SynthHD 54 MHz–13.6 GHz, SynthHD PRO 10 MHz–15 GHz — check your unit. |
 | `sweep.repeats` | Sweeps averaged together. Noise falls as √repeats, time grows linearly. |
 | `sweep.alternate_direction` | Reverses every 2nd repeat so slow drift cancels instead of tilting the lineshape. |
 | `sweep.estimate_errors` | Error bars from between-repeat scatter. Doubles acquisition memory; no effect at `repeats: 1`. |
+| `sweep.discard_frames` | Frames dropped after each frequency change so no frame straddles two frequencies. |
+| `sweep.settle_ms` | PLL lock time after a frequency step; set at least as long as `camera.exposure_ms`. |
+| `analysis.baseline_correction` | Robust line fit for normalisation instead of divide-by-max. |
+| `analysis.baseline_reject_sigma` | How far below the fit a point must lie to be treated as signal and excluded. |
+| `diagnostic.cycles` | ABBA cycles averaged by the MW check (4 frames each). |
 | `diagnostic.check_freq_mhz` | Frequency the "MW check" parks at. Must be a real resonance or the check correctly reports nothing. Ignored once a sweep has run. |
 | `diagnostic.cycles` | Interleaved off/on pairs averaged by the MW check; more cycles = lower noise floor. |
 | `diagnostic.settle_ms` | Wait after each RF switch during the MW check. Set at least as long as `camera.exposure_ms`. |
