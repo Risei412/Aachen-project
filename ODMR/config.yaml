@@ -1,4 +1,4 @@
-# Configuration for the click-to-measure ODMR application (ODMR/odmr_app.py).
+# Configuration for the widefield ODMR application (ODMR/odmr_app.py).
 # Copy this file if you need per-session variants, e.g. config_run2.yaml,
 # and point the app at it with: python odmr_app.py --config config_run2.yaml
 
@@ -6,6 +6,8 @@ mock: true            # true = run with simulated camera/generator (no hardware 
 
 camera:
   exposure_ms: 20.0    # camera exposure time per frame, in milliseconds
+  binning: 2           # average NxN pixel blocks; shrinks the datacube by N^2
+                       # and improves per-pixel SNR. Use 1 for full resolution.
 
 microwave:
   port: "COM7"         # Windows: COMx. Linux: /dev/ttyACM0 or /dev/ttyUSB0
@@ -20,4 +22,13 @@ sweep:
   frames_per_point: 3     # frames averaged at each frequency (reduces shot noise)
 
 roi:
-  half_size_px: 15      # clicked point +/- this many pixels defines the square ROI
+  half_size_px: 8       # clicked point +/- this many (binned) pixels is averaged
+                        # into the displayed ODMR spectrum
+
+analysis:
+  min_signal_fraction: 0.15   # contrast-map threshold: pixels dimmer than this
+                              # fraction of the brightest pixel are blanked, so
+                              # shot noise in dark areas doesn't swamp the scale
+
+output:
+  directory: "data"     # where "Save" writes the .npz datacubes

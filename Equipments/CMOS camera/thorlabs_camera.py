@@ -88,22 +88,50 @@ class ThorlabsCamera:
 class MockThorlabsCamera:
     """Simulated camera for development without hardware attached.
 
-    Produces a synthetic NV-diamond-like widefield image: a bright disk
-    (the sample under green excitation) sitting on a dark background,
-    with the mean brightness inside a configurable ROI dipping when the
-    (simulated) microwave frequency is on ODMR resonance. This lets the
-    whole GUI / sweep pipeline be exercised without any hardware.
+    Produces a synthetic image roughly matching what the camera sees
+    looking down a diamond anvil cell: a bright ring (light scattered off
+    the anvil/gasket edge), a darker culet interior, and a speckled blob
+    of NV-diamond microparticles near the centre.
+
+    Only the NV speckle responds to the microwave, so the photoluminescence
+    there dips when the (simulated) frequency crosses a resonance. The two
+    resonances are given a small spatial gradient across the field of view,
+    imitating a magnetic field gradient -- so clicking different spots
+    yields visibly different ODMR spectra, which is exactly what the
+    widefield datacube workflow is meant to reveal.
     """
 
-    def __init__(self, exposure_ms: float = 20.0, width: int = 640, height: int = 480):
+    # Zero-field-ish splitting of the two simulated NV resonances, in MHz.
+    _RESONANCE_LOW = 2820.0
+    _RESONANCE_HIGH = 2920.0
+    _LINEWIDTH_MHZ = 5.0
+    _MAX_CONTRAST = 0.18
+
+    def __init__(self, exposure_ms: float = 20.0, width: int = 1000, height: int = 651):
         self.exposure_ms = exposure_ms
         self.width = width
         self.height = height
         self._mw_freq_mhz = None
         self._rng = np.random.default_rng(0)
+
         yy, xx = np.mgrid[0:height, 0:width]
-        cx, cy, r = width / 2, height / 2, min(width, height) / 3
-        self._sample_mask = (xx - cx) ** 2 + (yy - cy) ** 2 < r ** 2
+        cx, cy = width / 2, height / 2
+        radius = np.hypot(xx - cx, yy - cy)
+        culet_r = min(width, height) * 0.45
+
+        # Bright annulus at the anvil edge, dark culet interior, dark surround.
+        background = 250.0 + 3400.0 * np.exp(-0.5 * ((radius - culet_r) / (culet_r * 0.12)) ** 2)
+        background += 600.0 * (radius < culet_r)
+
+        # Speckled NV-diamond powder near the centre of the culet.
+        nv_envelope = np.exp(-0.5 * (radius / (culet_r * 0.35)) ** 2)
+        speckle = self._rng.random((height, width)) ** 6  # sparse bright grains
+        self._nv_pl = 5000.0 * nv_envelope * speckle
+        self._background = background
+
+        # Magnetic-field-like gradient: shifts both resonances by up to
+        # +/-8 MHz from one side of the field of view to the other.
+        self._detuning_mhz = 8.0 * (xx - cx) / (width / 2)
 
     def set_exposure_ms(self, exposure_ms: float) -> None:
         self.exposure_ms = exposure_ms
@@ -113,18 +141,18 @@ class MockThorlabsCamera:
         self._mw_freq_mhz = freq_mhz if rf_on else None
 
     def get_frame(self, timeout_ms: int = 1000) -> np.ndarray:
-        base = np.full((self.height, self.width), 300.0)
-        base[self._sample_mask] = 4000.0
+        nv_pl = self._nv_pl
 
         if self._mw_freq_mhz is not None:
-            # Two synthetic NV ODMR dips (zero-field split by a bias field),
-            # e.g. around 2820 MHz and 2920 MHz, ~10 MHz wide, ~20% contrast.
-            for center in (2820.0, 2920.0):
-                dip = 0.2 * np.exp(-0.5 * ((self._mw_freq_mhz - center) / 5.0) ** 2)
-                base[self._sample_mask] *= (1.0 - dip)
+            dip = np.zeros_like(nv_pl)
+            for center in (self._RESONANCE_LOW, self._RESONANCE_HIGH):
+                detuned = self._mw_freq_mhz - (center + self._detuning_mhz)
+                dip += self._MAX_CONTRAST * np.exp(-0.5 * (detuned / self._LINEWIDTH_MHZ) ** 2)
+            nv_pl = nv_pl * (1.0 - np.clip(dip, 0.0, 1.0))
 
-        noisy = base + self._rng.normal(0, 15, size=base.shape)
-        return np.clip(noisy, 0, 65535).astype(np.uint16)
+        frame = self._background + nv_pl
+        frame = frame + self._rng.normal(0, 12, size=frame.shape)
+        return np.clip(frame, 0, 65535).astype(np.uint16)
 
     def close(self) -> None:
         pass
