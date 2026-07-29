@@ -38,7 +38,7 @@ import numpy as np
 import yaml
 from matplotlib import pyplot as plt
 from matplotlib.patches import Rectangle
-from matplotlib.widgets import Button
+from matplotlib.widgets import Button, Slider
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "Equipments", "CMOS camera"))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "Equipments", "Microwave generator"))
@@ -77,6 +77,12 @@ class OdmrApp:
             config.get("analysis", {}).get("min_signal_fraction", 0.15)
         )
         self.diag_cfg = config.get("diagnostic", {}) or {}
+        self.exposure_ms = float(config["camera"]["exposure_ms"])
+        limits = config["camera"].get("exposure_limits_ms", [0.05, 1000.0])
+        self.exposure_limits_ms = (float(limits[0]), float(limits[1]))
+        self.exposure_ms = float(
+            np.clip(self.exposure_ms, *self.exposure_limits_ms)
+        )
 
         # Measurement results, filled in once a sweep has run (or been loaded).
         self.frequencies_mhz: np.ndarray | None = None
@@ -96,6 +102,7 @@ class OdmrApp:
         self._build_figure()
 
         if cube_file is not None:
+            self.slider_exposure.set_active(False)
             self._load_measurement(cube_file)
         else:
             self._start_live_view()
@@ -120,7 +127,7 @@ class OdmrApp:
     def _build_figure(self) -> None:
         self.fig, (self.ax_img, self.ax_spec) = plt.subplots(1, 2, figsize=(13, 5.5))
         self.fig.canvas.manager.set_window_title("Widefield ODMR viewer")
-        self.fig.subplots_adjust(bottom=0.18, wspace=0.25)
+        self.fig.subplots_adjust(bottom=0.24, wspace=0.25)
 
         placeholder = np.zeros((10, 10))
         self.im = self.ax_img.imshow(placeholder, cmap="gray", origin="upper")
@@ -134,14 +141,28 @@ class OdmrApp:
         self.ax_spec.set_title("ODMR spectrum — run a sweep, then click the image")
         self.ax_spec.grid(True, alpha=0.3)
 
-        self.btn_sweep = Button(self.fig.add_axes([0.06, 0.04, 0.12, 0.07]), "Run sweep")
+        self.btn_sweep = Button(self.fig.add_axes([0.06, 0.03, 0.12, 0.06]), "Run sweep")
         self.btn_sweep.on_clicked(self._on_sweep_clicked)
-        self.btn_mwcheck = Button(self.fig.add_axes([0.19, 0.04, 0.12, 0.07]), "MW check")
+        self.btn_mwcheck = Button(self.fig.add_axes([0.19, 0.03, 0.12, 0.06]), "MW check")
         self.btn_mwcheck.on_clicked(self._on_mwcheck_clicked)
-        self.btn_view = Button(self.fig.add_axes([0.32, 0.04, 0.14, 0.07]), "View: PL")
+        self.btn_view = Button(self.fig.add_axes([0.32, 0.03, 0.14, 0.06]), "View: PL")
         self.btn_view.on_clicked(self._on_view_clicked)
-        self.btn_save = Button(self.fig.add_axes([0.47, 0.04, 0.10, 0.07]), "Save")
+        self.btn_save = Button(self.fig.add_axes([0.47, 0.03, 0.10, 0.06]), "Save")
         self.btn_save.on_clicked(self._on_save_clicked)
+
+        # Exposure is set on a logarithmic scale: usable values span three
+        # decades (a bright reflection needs tens of microseconds, a dim NV
+        # ensemble hundreds of milliseconds), which a linear slider cannot
+        # resolve at both ends.
+        self.slider_exposure = Slider(
+            self.fig.add_axes([0.10, 0.13, 0.36, 0.03]),
+            "Exposure",
+            np.log10(self.exposure_limits_ms[0]),
+            np.log10(self.exposure_limits_ms[1]),
+            valinit=np.log10(self.exposure_ms),
+        )
+        self.slider_exposure.on_changed(self._on_exposure_changed)
+        self._update_exposure_label(self.exposure_ms)
 
         self.status = self.fig.text(0.59, 0.06, "", fontsize=8.5, va="center")
 
@@ -161,6 +182,42 @@ class OdmrApp:
         self.ax_img.set_title(title)
         self.fig.canvas.draw_idle()
 
+    # ----------------------------------------------------------------- exposure
+
+    def _update_exposure_label(self, exposure_ms: float) -> None:
+        self.slider_exposure.valtext.set_text(f"{exposure_ms:.2f} ms")
+
+    def _on_exposure_changed(self, log_value: float) -> None:
+        """Apply a new exposure to the camera as the slider moves."""
+        if self.camera is None:
+            return
+        if self._sweeping:
+            # Changing exposure mid-sweep would make the datacube's frequency
+            # points incomparable, so refuse and snap the slider back.
+            self.slider_exposure.eventson = False
+            self.slider_exposure.set_val(np.log10(self.exposure_ms))
+            self.slider_exposure.eventson = True
+            self._set_status("Cannot change exposure during a sweep.")
+            return
+
+        requested = float(10.0 ** log_value)
+        # The camera quantises and clamps the request; show what it actually took.
+        applied = self.camera.set_exposure_ms(requested)
+        self.exposure_ms = float(applied) if applied else requested
+        self.config["camera"]["exposure_ms"] = self.exposure_ms
+        self._update_exposure_label(self.exposure_ms)
+
+    def _saturation_report(self, frame: np.ndarray) -> str:
+        """Fraction of pixels at (or within 1 % of) full well.
+
+        A saturated pixel carries no ODMR contrast -- its value cannot drop
+        when the microwave is applied -- so this is the number to watch when
+        setting exposure, not just how bright the picture looks.
+        """
+        level = getattr(self.camera, "saturation_level", 65535)
+        saturated = float(np.count_nonzero(frame >= 0.99 * level)) / frame.size
+        return f"{frame.max():.0f} peak, {100.0 * saturated:.2f} % saturated"
+
     # ---------------------------------------------------------------- live view
 
     def _start_live_view(self) -> None:
@@ -176,7 +233,10 @@ class OdmrApp:
             frame = self.camera.get_frame(timeout_ms=100)
         except TimeoutError:
             return
-        self._show_image(frame, "Live view — press 'Run sweep' to measure")
+        self._show_image(
+            frame,
+            f"Live view — {self.exposure_ms:.2f} ms, {self._saturation_report(frame)}",
+        )
 
     # -------------------------------------------------------------------- sweep
 

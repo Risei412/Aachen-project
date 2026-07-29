@@ -5,7 +5,13 @@
 mock: true            # true = run with simulated camera/generator (no hardware needed)
 
 camera:
-  exposure_ms: 20.0    # camera exposure time per frame, in milliseconds
+  exposure_ms: 20.0    # camera exposure time per frame, in milliseconds.
+                       # Adjustable live from the GUI slider; this is the
+                       # starting value. Watch the "% saturated" readout in
+                       # the live-view title: saturated pixels are clipped and
+                       # can show no ODMR contrast at all.
+  exposure_limits_ms: [0.05, 1000.0]   # slider range (log scale). The camera
+                       # clamps to its own hardware limits regardless.
   binning: 2           # average NxN pixel blocks; shrinks the datacube by N^2
                        # and improves per-pixel SNR. Use 1 for full resolution.
   dll_dir: "C:/Program Files/Thorlabs/Scientific Imaging/Scientific Camera Support/Scientific Camera Interfaces/SDK/Native Toolkit/dlls/Native_64_lib"

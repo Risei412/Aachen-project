@@ -73,31 +73,74 @@ class ThorlabsCamera:
                 "with the ThorCam GUI)."
             )
         self._camera = self._sdk.open_camera(camera_list[0])
-        self._camera.exposure_time_us = int(exposure_ms * 1000)
         self._camera.frames_per_trigger_zero_for_unlimited = 0
         if roi is not None:
             self._camera.roi = roi
-        self._camera.arm(2)
+
+        self._exposure_ms = exposure_ms
+        self._apply_exposure(exposure_ms)
+
+        # A deeper queue than the 2 frames used previously: during a long
+        # sweep the acquisition thread can be held up (plot redraws, disk
+        # I/O), and a shallow queue drops frames the moment that happens.
+        self._camera.arm(10)
         self._camera.issue_software_trigger()
 
-    def set_exposure_ms(self, exposure_ms: float) -> None:
-        self._camera.exposure_time_us = int(exposure_ms * 1000)
+    def _apply_exposure(self, exposure_ms: float) -> float:
+        """Set the exposure, clamped to what this camera actually supports."""
+        requested_us = int(exposure_ms * 1000)
+        low = getattr(self._camera, "exposure_time_range_us", None)
+        if low is not None:
+            requested_us = int(np.clip(requested_us, low.min, low.max))
+        self._camera.exposure_time_us = requested_us
+        # Read back: the camera quantises the value, so the effective
+        # exposure (which sets the frame timeout) may differ from the request.
+        self._exposure_ms = self._camera.exposure_time_us / 1000
+        return self._exposure_ms
 
-    def get_frame(self, timeout_ms: int = 1000) -> np.ndarray:
-        """Return the latest frame as a 2-D numpy array (mono, uint16)."""
+    @property
+    def exposure_ms(self) -> float:
+        return self._exposure_ms
+
+    @property
+    def saturation_level(self) -> int:
+        """Pixel value corresponding to a fully saturated (clipped) pixel."""
+        bit_depth = getattr(self._camera, "bit_depth", 16)
+        return (1 << bit_depth) - 1
+
+    def set_exposure_ms(self, exposure_ms: float) -> float:
+        return self._apply_exposure(exposure_ms)
+
+    def get_frame(self, timeout_ms: int | None = None) -> np.ndarray:
+        """Return the latest frame as a 2-D numpy array (mono, uint16).
+
+        The default timeout scales with the exposure time: a 500 ms
+        exposure cannot possibly deliver a frame within a fixed 1 s budget
+        once a couple of frames are already in flight, so a constant
+        timeout would spuriously fail exactly when long exposures are
+        needed for a dim sample.
+        """
+        if timeout_ms is None:
+            timeout_ms = max(1000, int(5 * self._exposure_ms + 500))
+
         frame = self._camera.get_pending_frame_or_null()
         if frame is None:
             # Poll briefly instead of blocking forever so the GUI stays responsive.
             import time
 
             waited = 0
-            poll_ms = 10
+            poll_ms = 5
             while frame is None and waited < timeout_ms:
                 time.sleep(poll_ms / 1000)
                 waited += poll_ms
                 frame = self._camera.get_pending_frame_or_null()
             if frame is None:
-                raise TimeoutError("Timed out waiting for a camera frame")
+                raise TimeoutError(
+                    f"Timed out after {timeout_ms} ms waiting for a camera frame "
+                    f"(exposure {self._exposure_ms:.1f} ms). The camera stopped "
+                    "delivering frames: check the USB connection, and that no "
+                    "other program (ThorCam) has taken the camera."
+                )
         return np.copy(frame.image_buffer).reshape(
             self._camera.image_height_pixels, self._camera.image_width_pixels
         )
@@ -164,14 +207,22 @@ class MockThorlabsCamera:
         # +/-8 MHz from one side of the field of view to the other.
         self._detuning_mhz = 8.0 * (xx - cx) / (width / 2)
 
-    def set_exposure_ms(self, exposure_ms: float) -> None:
+    # Exposure at which the scene brightnesses above are calibrated.
+    _REFERENCE_EXPOSURE_MS = 20.0
+
+    @property
+    def saturation_level(self) -> int:
+        return 65535
+
+    def set_exposure_ms(self, exposure_ms: float) -> float:
         self.exposure_ms = exposure_ms
+        return self.exposure_ms
 
     def set_mw_state(self, freq_mhz: float | None, power_dbm: float, rf_on: bool) -> None:
         """Used by the mock MW driver so the mock camera can react to it."""
         self._mw_freq_mhz = freq_mhz if rf_on else None
 
-    def get_frame(self, timeout_ms: int = 1000) -> np.ndarray:
+    def get_frame(self, timeout_ms: int | None = None) -> np.ndarray:
         nv_pl = self._nv_pl
 
         if self._mw_freq_mhz is not None:
@@ -181,9 +232,16 @@ class MockThorlabsCamera:
                 dip += self._MAX_CONTRAST * np.exp(-0.5 * (detuned / self._LINEWIDTH_MHZ) ** 2)
             nv_pl = nv_pl * (1.0 - np.clip(dip, 0.0, 1.0))
 
-        frame = self._background + nv_pl
-        frame = frame + self._rng.normal(0, 12, size=frame.shape)
-        return np.clip(frame, 0, 65535).astype(np.uint16)
+        # Collected signal scales with exposure, so the simulated frame
+        # brightens (and eventually clips at saturation) as the exposure
+        # slider is moved -- otherwise the slider would appear to do
+        # nothing in mock mode.
+        gain = self.exposure_ms / self._REFERENCE_EXPOSURE_MS
+        frame = (self._background + nv_pl) * gain
+        # Photon shot noise grows as the square root of the collected signal,
+        # so longer exposures improve SNR rather than just scaling everything.
+        frame = frame + self._rng.normal(0, 12 * np.sqrt(gain), size=frame.shape)
+        return np.clip(frame, 0, self.saturation_level).astype(np.uint16)
 
     def close(self) -> None:
         pass

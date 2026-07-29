@@ -33,6 +33,13 @@ and you can probe as many points as you like from one measurement.
 ## Using the app
 
 1. The app opens on a **live view** — use it to focus and position the sample.
+   Drag the **Exposure** slider (logarithmic, 0.05–1000 ms by default) to set
+   the exposure live. The title reports the peak pixel value and the
+   **percentage of saturated pixels** — keep that at 0 %: a clipped pixel
+   cannot get darker when the microwave is applied, so it carries no ODMR
+   contrast at all, no matter how good the rest of the setup is. Exposure is
+   locked during a sweep, since changing it mid-sweep would make the
+   datacube's frequency points incomparable.
 2. Press **"MW check"** first (see below) to confirm the NV centers are
    actually responding, before spending minutes on a full sweep.
 3. Press **"Run sweep"**. Progress is shown as the frequency advances; press
@@ -181,6 +188,8 @@ Sweep time is roughly
 | `sweep.settle_ms` | PLL lock time after each frequency step. Increase if spectra look noisy. |
 | `sweep.frames_per_point` | Frames averaged per frequency; trades sweep time for SNR. |
 | `camera.binning` | Cuts datacube size by N² and raises per-pixel SNR. |
+| `camera.exposure_ms` | Starting exposure; adjust live with the GUI slider. Longer collects more photons (better SNR) but slows the sweep and risks saturation. |
+| `camera.exposure_limits_ms` | Range of the exposure slider. The camera clamps to its own hardware limits anyway. |
 | `roi.half_size_px` | Larger ROI averages more pixels (smoother spectrum) but blurs spatial detail. |
 | `diagnostic.check_freq_mhz` | Frequency the "MW check" parks at. Must be a real resonance or the check correctly reports nothing. Ignored once a sweep has run. |
 | `diagnostic.cycles` | Interleaved off/on pairs averaged by the MW check; more cycles = lower noise floor. |
