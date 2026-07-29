@@ -66,9 +66,75 @@ and you can probe as many points as you like from one measurement.
    (whichever are available). The contrast map shows where the microwave
    actually modulates the PL, i.e. where the NV centers are — useful for
    finding the NV layer before picking readout spots.
-7. **"Save"** writes the datacube to `data/odmr_<timestamp>.npz`. Re-open it
-   later with `python odmr_app.py --load data/odmr_....npz` to keep clicking
-   around the data with no hardware attached.
+7. **"Save raw"** writes the full datacube to `data/odmr_<timestamp>.npz`.
+   Re-open it later with `python odmr_app.py --load data/odmr_....npz` to keep
+   clicking around the data with no hardware attached. These files are large
+   and stay local (git-ignored).
+8. **"Export"** writes a small, shareable bundle to
+   `results/<timestamp>/` — see *Publishing results* below.
+
+## Running it in VS Code
+
+Open the repository folder in VS Code (**File > Open Folder**, choose the
+`Aachen-project` folder — not `ODMR/` on its own, since the app loads the
+instrument drivers from `../Equipments/`).
+
+1. Accept the recommended extensions when prompted (Python, Pylance).
+2. Select the interpreter: **Ctrl+Shift+P** → *Python: Select Interpreter*.
+   Point it at the virtual environment you installed the requirements into.
+3. Install dependencies: **Ctrl+Shift+P** → *Tasks: Run Task* →
+   **ODMR: install Python dependencies**.
+4. Press **F5** and pick a configuration:
+
+| Configuration | What it does |
+| --- | --- |
+| ODMR: real hardware (camera + SynthHD) | Runs against the Thorlabs camera and COM port in `config.yaml` |
+| ODMR: simulated hardware | Runs with mocks, no instruments needed |
+| ODMR: re-open a saved datacube | Prompts for an `.npz` and opens it for analysis |
+| ODMR: publish results (dry run) | Shows what would be pushed, changes nothing |
+
+The plot window needs a real GUI, so all configurations run in the
+integrated terminal rather than the debug console.
+
+## Publishing results to GitHub
+
+Raw datacubes cannot go into version control: one sweep is hundreds of
+megabytes, GitHub warns above 50 MB per file and rejects above 100 MB, and
+a repository accumulating them becomes impractical to clone. So the split
+is deliberate:
+
+- **`ODMR/data/`** — full `.npz` datacubes from **"Save raw"**. Git-ignored,
+  stays on the acquisition machine.
+- **`ODMR/results/`** — compact bundles from **"Export"**. Tracked by git.
+
+Each exported bundle is about 1–2 MB and contains:
+
+| File | Contents |
+| --- | --- |
+| `metadata.json` | Every setting used, plus the **git commit** that produced the result (marked `-dirty` if the working tree had uncommitted changes), so a result can be traced to exact code and configuration |
+| `spectrum_x*_y*_r*.csv` | The ROI spectrum: frequency, raw counts, normalised %, fitted baseline, repeat count, error |
+| `spectrum.png` | Plotted spectrum with error band |
+| `maps.png` | Mean PL and ODMR contrast map, with the ROI marked |
+| `maps.npz` | Those two maps as float32 arrays, so the shared result carries real numbers and not only pictures |
+| `README.md` | Human-readable summary with a dip/contrast table |
+
+To publish, from `ODMR/`:
+
+```bash
+python publish_results.py --dry-run   # check what would be committed
+python publish_results.py             # commit + push the newest bundle
+python publish_results.py --all       # every unpublished bundle
+python publish_results.py -m "culet centre, 2 GPa"
+```
+
+or use **Tasks: Run Task** → *ODMR: publish results to GitHub*.
+
+This is a deliberate manual step, not something the acquisition GUI does on
+its own — pushing is outward-facing and should not happen as a side effect
+of pressing a button mid-experiment. The script refuses to commit any file
+over 100 MB (and warns above 50 MB) rather than letting the push fail after
+the commit is already made, and retries transient network failures with
+exponential backoff.
 
 ## Repeated sweeps and error bars
 

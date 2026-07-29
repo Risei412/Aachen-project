@@ -88,4 +88,8 @@ diagnostic:                   # settings for the "MW check" button (quick NV res
   settle_ms: 30.0             # wait after each RF switch; set >= camera exposure_ms
 
 output:
-  directory: "data"     # where "Save" writes the .npz datacubes
+  directory: "data"            # "Save raw" writes full .npz datacubes here.
+                               # Git-ignored: a sweep is hundreds of MB.
+  results_directory: "results" # "Export" writes small publishable bundles here
+                               # (metadata, spectra CSV, plots, maps). These ARE
+                               # tracked by git -- push them with publish_results.py

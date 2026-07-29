@@ -1,23 +1,54 @@
 {
+    // Press F5, or pick a configuration from the Run and Debug panel (Ctrl+Shift+D).
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "ODMR: click-to-measure (mock hardware)",
-            "type": "debugpy",
-            "request": "launch",
-            "program": "${workspaceFolder}/ODMR/odmr_app.py",
-            "args": ["--mock"],
-            "console": "integratedTerminal",
-            "justMyCode": true
-        },
-        {
-            "name": "ODMR: click-to-measure (real hardware)",
+            "name": "ODMR: real hardware (camera + SynthHD)",
             "type": "debugpy",
             "request": "launch",
             "program": "${workspaceFolder}/ODMR/odmr_app.py",
             "args": ["--no-mock"],
+            "cwd": "${workspaceFolder}/ODMR",
             "console": "integratedTerminal",
             "justMyCode": true
+        },
+        {
+            "name": "ODMR: simulated hardware (no instruments needed)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/ODMR/odmr_app.py",
+            "args": ["--mock"],
+            "cwd": "${workspaceFolder}/ODMR",
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "ODMR: re-open a saved datacube (prompts for file)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/ODMR/odmr_app.py",
+            "args": ["--load", "${input:cubeFile}"],
+            "cwd": "${workspaceFolder}/ODMR",
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "ODMR: publish results to GitHub (dry run)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/ODMR/publish_results.py",
+            "args": ["--dry-run"],
+            "cwd": "${workspaceFolder}/ODMR",
+            "console": "integratedTerminal",
+            "justMyCode": true
+        }
+    ],
+    "inputs": [
+        {
+            "id": "cubeFile",
+            "type": "promptString",
+            "description": "Path to a saved .npz datacube",
+            "default": "data/odmr_.npz"
         }
     ]
 }

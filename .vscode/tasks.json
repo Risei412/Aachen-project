@@ -1,0 +1,40 @@
+{
+    // Run with Terminal > Run Task..., or Ctrl+Shift+P -> "Tasks: Run Task".
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "ODMR: install Python dependencies",
+            "type": "shell",
+            "command": "${command:python.interpreterPath}",
+            "args": ["-m", "pip", "install", "-r", "requirements.txt"],
+            "options": { "cwd": "${workspaceFolder}/ODMR" },
+            "problemMatcher": []
+        },
+        {
+            "label": "ODMR: publish results to GitHub",
+            "detail": "Commits and pushes the newest exported bundle in ODMR/results/",
+            "type": "shell",
+            "command": "${command:python.interpreterPath}",
+            "args": ["publish_results.py"],
+            "options": { "cwd": "${workspaceFolder}/ODMR" },
+            "problemMatcher": []
+        },
+        {
+            "label": "ODMR: publish results (dry run)",
+            "detail": "Shows what would be committed, changes nothing",
+            "type": "shell",
+            "command": "${command:python.interpreterPath}",
+            "args": ["publish_results.py", "--dry-run"],
+            "options": { "cwd": "${workspaceFolder}/ODMR" },
+            "problemMatcher": []
+        },
+        {
+            "label": "ODMR: publish ALL result bundles",
+            "type": "shell",
+            "command": "${command:python.interpreterPath}",
+            "args": ["publish_results.py", "--all"],
+            "options": { "cwd": "${workspaceFolder}/ODMR" },
+            "problemMatcher": []
+        }
+    ]
+}

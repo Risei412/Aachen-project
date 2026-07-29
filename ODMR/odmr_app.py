@@ -59,6 +59,7 @@ from odmr_sweep import (  # noqa: E402
     save_cube,
     summarize_difference,
 )
+from export_results import export_measurement  # noqa: E402
 from thorlabs_camera import MockThorlabsCamera, ThorlabsCamera  # noqa: E402
 from synthhd import MockSynthHD, SynthHD  # noqa: E402
 
@@ -156,14 +157,16 @@ class OdmrApp:
         self.ax_spec.set_title("ODMR spectrum — run a sweep, then click the image")
         self.ax_spec.grid(True, alpha=0.3)
 
-        self.btn_sweep = Button(self.fig.add_axes([0.06, 0.03, 0.12, 0.06]), "Run sweep")
+        self.btn_sweep = Button(self.fig.add_axes([0.045, 0.03, 0.105, 0.06]), "Run sweep")
         self.btn_sweep.on_clicked(self._on_sweep_clicked)
-        self.btn_mwcheck = Button(self.fig.add_axes([0.19, 0.03, 0.12, 0.06]), "MW check")
+        self.btn_mwcheck = Button(self.fig.add_axes([0.16, 0.03, 0.105, 0.06]), "MW check")
         self.btn_mwcheck.on_clicked(self._on_mwcheck_clicked)
-        self.btn_view = Button(self.fig.add_axes([0.32, 0.03, 0.14, 0.06]), "View: PL")
+        self.btn_view = Button(self.fig.add_axes([0.275, 0.03, 0.125, 0.06]), "View: PL")
         self.btn_view.on_clicked(self._on_view_clicked)
-        self.btn_save = Button(self.fig.add_axes([0.47, 0.03, 0.10, 0.06]), "Save")
+        self.btn_save = Button(self.fig.add_axes([0.41, 0.03, 0.085, 0.06]), "Save raw")
         self.btn_save.on_clicked(self._on_save_clicked)
+        self.btn_export = Button(self.fig.add_axes([0.505, 0.03, 0.085, 0.06]), "Export")
+        self.btn_export.on_clicked(self._on_export_clicked)
 
         # Sweep parameters are editable before the run rather than only via
         # config.yaml, so the range can be narrowed onto a resonance found by
@@ -208,7 +211,7 @@ class OdmrApp:
         )
         self.slider_roi.on_changed(self._on_roi_size_changed)
 
-        self.status = self.fig.text(0.59, 0.06, "", fontsize=8.5, va="center")
+        self.status = self.fig.text(0.605, 0.06, "", fontsize=8, va="center")
         self._update_plan()
 
         self.fig.canvas.mpl_connect("button_press_event", self._on_click)
@@ -774,6 +777,45 @@ class OdmrApp:
         )
         print(f"Saved datacube to {path}")
         self._set_status(f"Saved to {path}")
+
+    def _on_export_clicked(self, event) -> None:
+        """Write a small, publishable bundle (not the raw cube) for git."""
+        if self.cube is None:
+            self._set_status("Nothing to export — run a sweep first.")
+            return
+
+        rois = [self._last_roi] if self._last_roi is not None else [
+            Roi(self.cube.shape[2] // 2, self.cube.shape[1] // 2, self.roi_half_size)
+        ]
+        baselines = [self._spectrum_baseline(roi_spectrum(self.cube, roi)) for roi in rois]
+
+        results_root = self.config.get("output", {}).get(
+            "results_directory", os.path.join(os.path.dirname(__file__), "results")
+        )
+        try:
+            out_dir = export_measurement(
+                results_root,
+                OdmrResult(
+                    frequencies_mhz=self.frequencies_mhz,
+                    cube=self.cube,
+                    counts=self.counts,
+                    sem=self.sem,
+                    repeats_completed=self.repeats_completed,
+                ),
+                config=self.config,
+                rois=rois,
+                baselines=baselines,
+                min_signal_fraction=self.min_signal_fraction,
+            )
+        except Exception as exc:
+            print(f"Export failed: {exc}")
+            self._set_status(f"Export failed: {exc}")
+            return
+
+        relative = os.path.relpath(out_dir, os.path.dirname(__file__))
+        print(f"Exported results to {out_dir}")
+        print("Publish with:  python publish_results.py")
+        self._set_status(f"Exported to {relative} — run publish_results.py to push.")
 
     def _load_measurement(self, path: str) -> None:
         result, metadata = load_cube(path)
