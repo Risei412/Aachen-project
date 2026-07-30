@@ -6,8 +6,26 @@ import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.datavalidation import DataValidation
+from openpyxl.worksheet.page import PageMargins
 
 DST = Path(__file__).parent / "DACNV_輸出手続き_発送_振動対策.xlsx"
+
+
+def setup_print(ws, header_row=None, landscape=True, fit_width=True):
+    """印刷用の共通設定：用紙・改ページ位置での見出し繰り返し・余白・拡大縮小。"""
+    ws.page_setup.orientation = "landscape" if landscape else "portrait"
+    ws.page_setup.paperSize = ws.PAPERSIZE_A4
+    ws.page_setup.fitToPage = fit_width
+    if fit_width:
+        ws.page_setup.fitToWidth = 1
+        ws.page_setup.fitToHeight = 0
+    ws.sheet_properties.pageSetUpPr.fitToPage = fit_width
+    ws.page_margins = PageMargins(left=0.4, right=0.4, top=0.5, bottom=0.5,
+                                   header=0.2, footer=0.2)
+    if header_row:
+        ws.print_title_rows = f"{header_row}:{header_row}"
+    ws.oddFooter.center.text = "&P / &N ページ"
+    ws.oddFooter.right.text = "&D"
 
 HDR_FILL = PatternFill("solid", fgColor="1F3864")
 HDR_FONT = Font(color="FFFFFF", bold=True, size=10)
@@ -611,6 +629,14 @@ ws6.cell(r, 2, "群の意味：I＝メーカーに請求すれば出る／II＝�
 r += 1
 ws6.cell(r, 2, "「判定結果」欄には該当項番（例：第9項）または「非該当」と、その根拠書類名を書く。"
                "ECCN だけでは日本の申請の根拠にならない点に注意。").font = Font(size=9)
+
+# ================= 印刷設定 =================
+setup_print(ws, header_row=4)   # 判定リードタイム
+setup_print(ws2, header_row=4)  # 発送サービス比較
+setup_print(ws3, header_row=4)  # 振動対策・梱包
+setup_print(ws4, header_row=4)  # 時系列チェックリスト
+setup_print(ws5, landscape=False, fit_width=True)  # 該非判定書_手順（縦・文章主体）
+setup_print(ws6, header_row=4)  # 該非判定書_追跡表
 
 wb.save(DST)
 print("saved", DST)

@@ -5,10 +5,29 @@ from pathlib import Path
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
+from openpyxl.worksheet.page import PageMargins
 
 HERE = Path(__file__).parent
 SRC = HERE / "DACNV_Equipment_List_1.xlsx"
 DST = HERE / "DACNV_Equipment_List_輸送分類.xlsx"
+
+
+def setup_print(ws, header_row=None, landscape=True, fit_width=True):
+    """印刷用の共通設定：用紙・改ページ位置での見出し繰り返し・余白・拡大縮小。"""
+    ws.page_setup.orientation = "landscape" if landscape else "portrait"
+    ws.page_setup.paperSize = ws.PAPERSIZE_A4
+    ws.page_setup.fitToPage = fit_width
+    if fit_width:
+        ws.page_setup.fitToWidth = 1
+        ws.page_setup.fitToHeight = 0
+    ws.sheet_properties.pageSetUpPr.fitToPage = fit_width
+    ws.page_margins = PageMargins(left=0.4, right=0.4, top=0.5, bottom=0.5,
+                                   header=0.2, footer=0.2)
+    ws.print_options.horizontalCentered = False
+    if header_row:
+        ws.print_title_rows = f"{header_row}:{header_row}"
+    ws.oddFooter.center.text = "&P / &N ページ"
+    ws.oddFooter.right.text = "&D"
 
 C1 = "①発送のみ"
 C2 = "②機内持込のみ"
@@ -379,6 +398,12 @@ for kind, text in MEMO:
         cell.alignment = Alignment(wrap_text=True, vertical="top")
         ws3.row_dimensions[rr].height = max(15, 15 * (len(text) // 52 + 1))
     rr += 1
+
+# ================= 印刷設定 =================
+setup_print(wb["機材一覧"], header_row=4)
+setup_print(ws, header_row=HR)                 # 輸送分類
+setup_print(ws2, header_row=None)               # 再購入リスト（セクション見出しが複数あるため繰り返し行なし）
+setup_print(ws3, landscape=False, fit_width=True)  # 重要品目メモ（縦・文章主体）
 
 wb.save(DST)
 print("saved", DST)
