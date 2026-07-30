@@ -12,10 +12,14 @@ SRC = HERE / "DACNV_Equipment_List_1.xlsx"
 DST = HERE / "DACNV_Equipment_List_輸送分類.xlsx"
 
 
-def setup_print(ws, header_row=None, landscape=True, fit_width=True):
-    """印刷用の共通設定：用紙・改ページ位置での見出し繰り返し・余白・拡大縮小。"""
+def setup_print(ws, header_row=None, landscape=True, fit_width=True, paper="A4"):
+    """印刷用の共通設定：用紙・改ページ位置での見出し繰り返し・余白・拡大縮小。
+
+    列数の多い表は A4 に収めると実効フォントが 5pt 以下になり印刷しても読めないため、
+    paper="A3" を指定して用紙側で幅を稼ぐ。
+    """
     ws.page_setup.orientation = "landscape" if landscape else "portrait"
-    ws.page_setup.paperSize = ws.PAPERSIZE_A4
+    ws.page_setup.paperSize = ws.PAPERSIZE_A3 if paper == "A3" else ws.PAPERSIZE_A4
     ws.page_setup.fitToPage = fit_width
     if fit_width:
         ws.page_setup.fitToWidth = 1
@@ -208,7 +212,7 @@ for it in items:
     r += 1
 
 LAST = r - 1
-widths = [13, 30, 13, 22, 6, 12, 10, 10, 12, 22, 26, 7, 62, 32]
+widths = [13, 26, 12, 18, 5, 11, 9, 9, 11, 18, 20, 6, 36, 22]
 for c, w in enumerate(widths, 1):
     ws.column_dimensions[get_column_letter(c)].width = w
 ws.auto_filter.ref = f"A{HR}:N{LAST}"
@@ -324,14 +328,14 @@ for it in sec_d:
         cell.alignment = CTR if c in (5, 6) else WRAP
     r2 += 1
 
-for c, w in enumerate([13, 30, 13, 22, 7, 13, 13, 16, 46], 1):
+for c, w in enumerate([12, 24, 13, 20, 7, 12, 12, 14, 30], 1):
     ws2.column_dimensions[get_column_letter(c)].width = w
 
 # ================= シート3: 重要品目メモ =================
 ws3 = wb.create_sheet("重要品目メモ", 3)
 ws3.sheet_view.showGridLines = False
 ws3.column_dimensions["A"].width = 4
-ws3.column_dimensions["B"].width = 110
+ws3.column_dimensions["B"].width = 88
 
 MEMO = [
     ("H1", "レーザーとマイクロ波アンプの機内持込 — 実現性の評価"),
@@ -396,12 +400,11 @@ for kind, text in MEMO:
         rr += 1
     else:
         cell.alignment = Alignment(wrap_text=True, vertical="top")
-        ws3.row_dimensions[rr].height = max(15, 15 * (len(text) // 52 + 1))
     rr += 1
 
 # ================= 印刷設定 =================
-setup_print(wb["機材一覧"], header_row=4)
-setup_print(ws, header_row=HR)                 # 輸送分類
+setup_print(wb["機材一覧"], header_row=4, paper="A3")  # 元の列幅が広いため A3
+setup_print(ws, header_row=HR, paper="A3")      # 輸送分類（14列。A4では読めない大きさになる）
 setup_print(ws2, header_row=None)               # 再購入リスト（セクション見出しが複数あるため繰り返し行なし）
 setup_print(ws3, landscape=False, fit_width=True)  # 重要品目メモ（縦・文章主体）
 

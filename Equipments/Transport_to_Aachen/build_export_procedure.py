@@ -11,10 +11,14 @@ from openpyxl.worksheet.page import PageMargins
 DST = Path(__file__).parent / "DACNV_輸出手続き_発送_振動対策.xlsx"
 
 
-def setup_print(ws, header_row=None, landscape=True, fit_width=True):
-    """印刷用の共通設定：用紙・改ページ位置での見出し繰り返し・余白・拡大縮小。"""
+def setup_print(ws, header_row=None, landscape=True, fit_width=True, paper="A4"):
+    """印刷用の共通設定：用紙・改ページ位置での見出し繰り返し・余白・拡大縮小。
+
+    列数の多い表は A4 に収めると実効フォントが 5pt 以下になり印刷しても読めないため、
+    paper="A3" を指定して用紙側で幅を稼ぐ。
+    """
     ws.page_setup.orientation = "landscape" if landscape else "portrait"
-    ws.page_setup.paperSize = ws.PAPERSIZE_A4
+    ws.page_setup.paperSize = ws.PAPERSIZE_A3 if paper == "A3" else ws.PAPERSIZE_A4
     ws.page_setup.fitToPage = fit_width
     if fit_width:
         ws.page_setup.fitToWidth = 1
@@ -135,7 +139,7 @@ for rank, item, maker, risk, cause, dur, worst, action, fill in ROWS:
     ws.cell(r, 7).fill = fill
     r += 1
 
-widths(ws, [6, 26, 22, 24, 60, 20, 20, 60])
+widths(ws, [5, 22, 18, 20, 44, 15, 15, 44])
 ws.freeze_panes = "B5"
 
 r += 2
@@ -179,7 +183,7 @@ for h, b in POINTS:
     c = ws.cell(r, 2, b)
     c.alignment = WRAP
     ws.merge_cells(start_row=r, start_column=2, end_row=r, end_column=8)
-    ws.row_dimensions[r].height = 15 * (len(b) // 95 + 2)
+    ws.row_dimensions[r].height = 15 * (len(b) // 85 + 2)   # 結合幅 B:H に合わせる
     r += 2
 
 
@@ -248,7 +252,7 @@ for name, days, proc, fit, cost, pro, con, rec, fill in SVC:
     ws2.cell(r, 8).font = Font(bold=True)
     r += 1
 
-widths(ws2, [30, 18, 34, 30, 18, 46, 60, 22])
+widths(ws2, [24, 14, 26, 24, 14, 34, 44, 16])
 ws2.freeze_panes = "B5"
 
 r += 2
@@ -267,7 +271,7 @@ for t in [
     c = ws2.cell(r, 1, t)
     c.alignment = WRAP
     ws2.merge_cells(start_row=r, start_column=1, end_row=r, end_column=8)
-    ws2.row_dimensions[r].height = 15 * (len(t) // 100 + 1)
+    ws2.row_dimensions[r].height = 15 * (len(t) // 95 + 2)   # 結合幅 A:H に合わせる
     r += 1
 
 
@@ -348,7 +352,7 @@ for tgt, act, why in VIB:
     ws3.cell(r, 2).font = Font(bold=True)
     r += 1
 
-widths(ws3, [18, 40, 95])
+widths(ws3, [14, 32, 72])
 ws3.freeze_panes = "A5"
 
 
@@ -405,7 +409,7 @@ for when, what, who, note in CHK:
     ws4.cell(r, 1).fill = BLU if "D-3ヶ月" in when else (GRN if when.startswith("D+") or when == "D 当日" else YEL)
     r += 1
 
-widths(ws4, [14, 60, 22, 8, 60])
+widths(ws4, [12, 46, 18, 7, 46])
 ws4.freeze_panes = "B5"
 
 
@@ -417,7 +421,7 @@ title(ws5, "該非判定書の集め方",
       "まず仕分けてから動くこと。", 4)
 
 ws5.column_dimensions["A"].width = 4
-ws5.column_dimensions["B"].width = 118
+ws5.column_dimensions["B"].width = 76
 
 SEC = [
  ("H", "ステップ0：まず4群に仕分ける"),
@@ -543,12 +547,10 @@ for kind, text in SEC:
         c.alignment = Alignment(wrap_text=True, vertical="top")
         c.fill = PatternFill("solid", fgColor="F2F2F2")
         c.border = BORDER
-        ws5.row_dimensions[r].height = 15 * (text.count("\n") + 2)
         r += 2
         continue
     c = ws5.cell(r, 2, ("・" + text) if kind == "L" else text)
     c.alignment = Alignment(wrap_text=True, vertical="top")
-    ws5.row_dimensions[r].height = 15 * (len(text) // 56 + 1)
     r += 1
     if kind == "P":
         r += 1
@@ -619,7 +621,7 @@ ws6.conditional_formatting.add(
     f"L5:L{TRK_LAST}",
     CellIsRule(operator="equal", formula=['"未着手"'], fill=YEL))
 
-widths(ws6, [8, 44, 18, 26, 10, 24, 12, 12, 12, 26, 20, 20])
+widths(ws6, [7, 36, 15, 22, 8, 20, 11, 11, 11, 22, 16, 17])
 ws6.freeze_panes = "B5"
 ws6.auto_filter.ref = f"A4:L{TRK_LAST}"
 
@@ -631,12 +633,12 @@ ws6.cell(r, 2, "「判定結果」欄には該当項番（例：第9項）また
                "ECCN だけでは日本の申請の根拠にならない点に注意。").font = Font(size=9)
 
 # ================= 印刷設定 =================
-setup_print(ws, header_row=4)   # 判定リードタイム
-setup_print(ws2, header_row=4)  # 発送サービス比較
-setup_print(ws3, header_row=4)  # 振動対策・梱包
-setup_print(ws4, header_row=4)  # 時系列チェックリスト
+setup_print(ws, header_row=4, paper="A3")   # 判定リードタイム（長文列が2本ある）
+setup_print(ws2, header_row=4, paper="A3")  # 発送サービス比較（同上）
+setup_print(ws3, header_row=4)              # 振動対策・梱包
+setup_print(ws4, header_row=4)              # 時系列チェックリスト
 setup_print(ws5, landscape=False, fit_width=True)  # 該非判定書_手順（縦・文章主体）
-setup_print(ws6, header_row=4)  # 該非判定書_追跡表
+setup_print(ws6, header_row=4, paper="A3")  # 該非判定書_追跡表（12列・記入用）
 
 wb.save(DST)
 print("saved", DST)
