@@ -298,20 +298,31 @@ python odmr_app.py
 
 1. Install **ThorCam** from thorlabs.com — this installs the camera's USB
    driver and the TSI SDK.
-2. Install the matching Python wheel from the ThorCam install directory:
-   ```
-   pip install "C:/Program Files/Thorlabs/Scientific Imaging/Scientific Camera Support/Scientific Camera Interfaces/SDK/Python Toolkit/thorlabs_tsi_sdk-*.whl"
-   ```
-3. Set `camera.dll_dir` in `config.yaml` to the folder with the native DLLs,
-   e.g. `.../SDK/Native Toolkit/dlls/Native_64_lib`. This step is easy to
-   miss: `pip install`ing `thorlabs_tsi_sdk` only gets you the Python
-   wrapper, and importing it fails with
+2. Get the Python SDK from `.../Scientific Camera Interfaces/SDK/Python
+   Toolkit/`. Two layouts exist depending on your ThorCam version — check
+   which one you have:
+   - **Older layout** — a `thorlabs_tsi_sdk-*.whl` file sits directly in
+     that folder. Install it:
+     ```
+     pip install "C:/Program Files/Thorlabs/Scientific Imaging/Scientific Camera Support/Scientific Camera Interfaces/SDK/Python Toolkit/thorlabs_tsi_sdk-*.whl"
+     ```
+   - **Newer layout** — no wheel at all, instead a `source/` subfolder with
+     loose files (`tl_camera.py` etc.) and its own `dlls/32_lib` /
+     `dlls/64_lib`. There is nothing to `pip install` here: set
+     `camera.sdk_source_dir` in `config.yaml` to that `source` folder, and
+     the app adds it to `sys.path` and imports `tl_camera` directly.
+3. Set `camera.dll_dir` in `config.yaml` to the folder with the native DLLs
+   — `.../SDK/Native Toolkit/dlls/Native_64_lib` on the older layout, or
+   `.../SDK/Python Toolkit/dlls/64_lib` on the newer one. This step is easy
+   to miss: having the Python SDK importable only gets you the wrapper, and
+   opening a camera fails with
    `Could not find module 'thorlabs_tsi_camera_sdk.dll'` unless this
    folder is explicitly registered — Python 3.8+ no longer searches plain
    `PATH` entries for a module's native dependencies, so just adding the
    folder to your system PATH is not enough on its own (the app calls
    `os.add_dll_directory()` for you once `dll_dir` is set). Match
-   `Native_64_lib` / `Native_32_lib` to your Python interpreter's bitness.
+   `64_lib` / `32_lib` (or `Native_64_lib` / `Native_32_lib`) to your Python
+   interpreter's bitness.
 4. **Close ThorCam itself** before running this app — the SDK cannot share
    the camera with the ThorCam GUI.
 5. See `Equipments/CMOS camera/camera-quick-start-guide-eng.pdf` for your

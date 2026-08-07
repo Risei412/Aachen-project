@@ -14,12 +14,19 @@ camera:
                        # clamps to its own hardware limits regardless.
   binning: 2           # average NxN pixel blocks; shrinks the datacube by N^2
                        # and improves per-pixel SNR. Use 1 for full resolution.
-  dll_dir: "C:/Program Files/Thorlabs/Scientific Imaging/Scientific Camera Support/Scientific Camera Interfaces/SDK/Native Toolkit/dlls/Native_64_lib"
+  dll_dir: "C:/Program Files/Thorlabs/Scientific Imaging/Scientific Camera Support/Scientific Camera Interfaces/SDK/Python Toolkit/dlls/64_lib"
                        # folder with the Thorlabs native DLLs (thorlabs_tsi_camera_sdk.dll
                        # and friends). Required for real hardware -- pip installing
                        # thorlabs_tsi_sdk alone does not make these loadable. Match
-                       # Native_64_lib / Native_32_lib to your Python's bitness.
-                       # Adjust the path to match your ThorCam SDK install location.
+                       # 64_lib / 32_lib (or Native_64_lib / Native_32_lib on older
+                       # SDK releases) to your Python's bitness. Adjust the path to
+                       # match your ThorCam SDK install location.
+  sdk_source_dir: "C:/Program Files/Thorlabs/Scientific Imaging/Scientific Camera Support/Scientific Camera Interfaces/SDK/Python Toolkit/source"
+                       # Only needed on newer ThorCam releases that ship the Python
+                       # SDK as loose source files instead of a thorlabs_tsi_sdk-*.whl
+                       # (no wheel to pip install in that case -- check whether
+                       # ".../Python Toolkit/" has a source/ subfolder). Leave unset
+                       # if you did `pip install thorlabs_tsi_sdk-*.whl`.
 
 microwave:
   port: "COM7"         # Windows: COMx. Linux: /dev/ttyACM0 or /dev/ttyUSB0

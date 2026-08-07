@@ -6,16 +6,28 @@ interface: ``open()``, ``get_frame()``, ``set_exposure_ms()``, ``close()``.
 
 Hardware setup (one-time, per PC):
     1. Install "ThorCam" from thorlabs.com (installs the TSI camera drivers).
-    2. Install the Python SDK that ships inside the ThorCam installation
-       directory, e.g.:
-           pip install "C:/Program Files/Thorlabs/Scientific Imaging/
-                        Scientific Camera Support/Scientific Camera
-                        Interfaces/SDK/Python Toolkit/thorlabs_tsi_sdk-*.whl"
+    2. Get the Python SDK, which ships inside the ThorCam installation
+       directory under ".../Scientific Camera Interfaces/SDK/Python Toolkit/".
+       Two distribution layouts exist depending on your ThorCam version:
+
+       - Older layout: a ``thorlabs_tsi_sdk-*.whl`` file directly in that
+         folder -- install it with
+             pip install "C:/Program Files/Thorlabs/Scientific Imaging/
+                          Scientific Camera Support/Scientific Camera
+                          Interfaces/SDK/Python Toolkit/thorlabs_tsi_sdk-*.whl"
+       - Newer layout: no wheel at all, just a ``source/`` subfolder with
+         loose files (``tl_camera.py`` etc.) and its own ``dlls/32_lib`` /
+         ``dlls/64_lib``. There is nothing to pip install here -- point
+         ``sdk_source_dir`` (constructor arg / ``camera.sdk_source_dir`` in
+         config.yaml) at that ``source`` folder instead, and this module adds
+         it to ``sys.path`` and imports ``tl_camera`` directly.
+
        (see camera-quick-start-guide-eng.pdf in this folder for the exact
        path shipped with your camera model).
     3. Point ``dll_dir`` (constructor arg / ``camera.dll_dir`` in
        config.yaml) at the folder containing the native DLLs, e.g.
-       "...Scientific Camera Interfaces/SDK/Native Toolkit/dlls/Native_64_lib".
+       "...Scientific Camera Interfaces/SDK/Native Toolkit/dlls/Native_64_lib"
+       (older layout) or ".../Python Toolkit/dlls/64_lib" (newer layout).
        Installing the pip package alone is *not* enough: importing
        ``thorlabs_tsi_sdk`` only pulls in the Python wrapper, and it will
        fail with "Could not find module 'thorlabs_tsi_camera_sdk.dll'"
@@ -24,13 +36,15 @@ Hardware setup (one-time, per PC):
        (see ``_add_dll_directory`` below). Match the DLL bitness (32/64-bit)
        to your Python interpreter's.
 
-If ``thorlabs_tsi_sdk`` is not importable (e.g. developing away from the
-lab PC), :class:`MockThorlabsCamera` below can be used as a drop-in
-replacement -- see ``ODMR/odmr_app.py`` for how it is selected.
+If neither ``thorlabs_tsi_sdk`` nor ``sdk_source_dir`` is importable (e.g.
+developing away from the lab PC), :class:`MockThorlabsCamera` below can be
+used as a drop-in replacement -- see ``ODMR/odmr_app.py`` for how it is
+selected.
 """
 from __future__ import annotations
 
 import os
+import sys
 
 import numpy as np
 
@@ -55,26 +69,67 @@ def _add_dll_directory(dll_dir: str) -> None:
     os.environ["PATH"] = dll_dir + os.pathsep + os.environ.get("PATH", "")
 
 
+def _import_tl_camera_sdk(sdk_source_dir: str | None):
+    """Return the ``TLCameraSDK`` class, from whichever SDK layout is present.
+
+    Newer ThorCam releases ship the Python SDK as loose source files (no
+    installable package), so ``thorlabs_tsi_sdk`` may simply not exist even
+    with the SDK fully installed. Fall back to adding ``sdk_source_dir``
+    (the SDK's ``Python Toolkit/source`` folder) to ``sys.path`` and
+    importing the ``tl_camera`` module directly in that case.
+    """
+    try:
+        from thorlabs_tsi_sdk.tl_camera import TLCameraSDK  # imported lazily
+
+        return TLCameraSDK
+    except ModuleNotFoundError:
+        pass
+
+    if sdk_source_dir:
+        if not os.path.isdir(sdk_source_dir):
+            raise FileNotFoundError(
+                f"camera.sdk_source_dir not found: {sdk_source_dir!r}. Point it "
+                "at the SDK's 'Python Toolkit/source' folder (contains "
+                "tl_camera.py)."
+            )
+        if sdk_source_dir not in sys.path:
+            sys.path.insert(0, sdk_source_dir)
+        import tl_camera  # the newer SDK layout has no package wrapper
+
+        return tl_camera.TLCameraSDK
+
+    raise ModuleNotFoundError(
+        "thorlabs_tsi_sdk is not installed, and no camera.sdk_source_dir was "
+        "given. The Python SDK ships inside the ThorCam installation "
+        "directory under '.../Scientific Camera Interfaces/SDK/Python "
+        "Toolkit/'. Two layouts exist:\n"
+        "  - a thorlabs_tsi_sdk-*.whl file there: "
+        'pip install "C:/Program Files/Thorlabs/Scientific Imaging/'
+        "Scientific Camera Support/Scientific Camera Interfaces/SDK/"
+        'Python Toolkit/thorlabs_tsi_sdk-*.whl"\n'
+        "  - a 'source' subfolder with loose .py files (no wheel to "
+        "install): set camera.sdk_source_dir in config.yaml to that "
+        "'source' folder instead.\n"
+        "(see camera-quick-start-guide-eng.pdf in this folder for the exact "
+        "layout shipped with your camera model). Use config.yaml's "
+        "camera.mock: true to run without hardware."
+    )
+
+
 class ThorlabsCamera:
     """Live-view wrapper for a single Thorlabs TSI camera."""
 
-    def __init__(self, exposure_ms: float = 20.0, roi=None, dll_dir: str | None = None):
+    def __init__(
+        self,
+        exposure_ms: float = 20.0,
+        roi=None,
+        dll_dir: str | None = None,
+        sdk_source_dir: str | None = None,
+    ):
         if dll_dir:
             _add_dll_directory(dll_dir)
 
-        try:
-            from thorlabs_tsi_sdk.tl_camera import TLCameraSDK  # imported lazily
-        except ModuleNotFoundError as exc:
-            raise ModuleNotFoundError(
-                "thorlabs_tsi_sdk is not installed. Install the Python SDK that "
-                "ships inside the ThorCam installation directory, e.g.:\n"
-                '  pip install "C:/Program Files/Thorlabs/Scientific Imaging/'
-                "Scientific Camera Support/Scientific Camera Interfaces/SDK/"
-                'Python Toolkit/thorlabs_tsi_sdk-*.whl"\n'
-                "(see camera-quick-start-guide-eng.pdf in this folder for the "
-                "exact path shipped with your camera model). Use "
-                "config.yaml's camera.mock: true to run without hardware."
-            ) from exc
+        TLCameraSDK = _import_tl_camera_sdk(sdk_source_dir)
 
         self._sdk = TLCameraSDK()
         camera_list = self._sdk.discover_available_cameras()

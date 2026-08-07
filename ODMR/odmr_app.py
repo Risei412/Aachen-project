@@ -134,6 +134,7 @@ class OdmrApp:
         cam = ThorlabsCamera(
             exposure_ms=config["camera"]["exposure_ms"],
             dll_dir=config["camera"].get("dll_dir"),
+            sdk_source_dir=config["camera"].get("sdk_source_dir"),
         )
         gen = SynthHD(port=config["microwave"]["port"], channel=config["microwave"]["channel"])
         return cam, gen
