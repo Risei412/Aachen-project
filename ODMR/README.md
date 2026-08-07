@@ -51,7 +51,14 @@ and you can probe as many points as you like from one measurement.
    a rejected box snaps back to its last accepted value. `config.yaml` still
    supplies the starting values.
 3. Press **"MW check"** (see below) to confirm the NV centers are actually
-   responding, before spending minutes on a full sweep.
+   responding, before spending minutes on a full sweep. Press **"Quick
+   test"** for a faster look than that: it sweeps the same Start/Stop range
+   but caps it at 15 points with no repeats, so it finishes in a few seconds
+   regardless of how fine `Step`/`Repeats` are set for the real run. Useful
+   while focusing, positioning the ROI, or roughly locating a resonance
+   before committing to the full sweep. Its result is shown and can be
+   clicked like any other, but it is not meant to be exported — the status
+   line says "(rough check only, not for export)".
 4. Press **"Run sweep"**. Progress is shown as the frequency advances; press
    the same button (now "Abort") to stop early and keep the points measured
    so far. Sweep parameters are locked while it runs.

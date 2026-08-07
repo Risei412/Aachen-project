@@ -168,6 +168,14 @@ class OdmrApp:
         self.btn_save.on_clicked(self._on_save_clicked)
         self.btn_export = Button(self.fig.add_axes([0.505, 0.03, 0.085, 0.06]), "Export")
         self.btn_export.on_clicked(self._on_export_clicked)
+        # A full sweep with the configured step/repeats can take minutes, which
+        # is too slow for "is anything even working" checks (focus, ROI,
+        # rough resonance location) done many times while setting up. Quick
+        # test reuses the current Start/Stop but caps the point count and
+        # skips repeats, so it finishes in a few seconds regardless of what
+        # the real sweep is configured to do.
+        self.btn_quicktest = Button(self.fig.add_axes([0.60, 0.03, 0.105, 0.06]), "Quick test")
+        self.btn_quicktest.on_clicked(self._on_quicktest_clicked)
 
         # Sweep parameters are editable before the run rather than only via
         # config.yaml, so the range can be narrowed onto a resonance found by
@@ -212,7 +220,7 @@ class OdmrApp:
         )
         self.slider_roi.on_changed(self._on_roi_size_changed)
 
-        self.status = self.fig.text(0.605, 0.06, "", fontsize=8, va="center")
+        self.status = self.fig.text(0.72, 0.06, "", fontsize=8, va="center")
         self._update_plan()
 
         self.fig.canvas.mpl_connect("button_press_event", self._on_click)
@@ -405,35 +413,64 @@ class OdmrApp:
             return
         threading.Thread(target=self._run_sweep, daemon=True).start()
 
-    def _run_sweep(self) -> None:
+    def _on_quicktest_clicked(self, event) -> None:
+        if self.camera is None:
+            self._set_status("No hardware attached (opened from a saved file).")
+            return
+        if self._sweeping:
+            self._abort = True
+            self._set_status("Aborting sweep after the current point…")
+            return
+        threading.Thread(target=self._run_sweep, kwargs={"quick": True}, daemon=True).start()
+
+    # Quick test caps a run to this many points, however fine the configured
+    # step is, so it stays a few-second check rather than a scaled-down sweep.
+    _QUICK_TEST_MAX_POINTS = 15
+
+    def _run_sweep(self, quick: bool = False) -> None:
         self._sweeping = True
         self._abort = False
-        self.btn_sweep.label.set_text("Abort")
+        button = self.btn_quicktest if quick else self.btn_sweep
+        button.label.set_text("Abort")
 
-        freqs = frequency_axis(
-            self.sweep_cfg["start_mhz"], self.sweep_cfg["stop_mhz"], self.sweep_cfg["step_mhz"]
-        )
-        repeats = max(1, int(self.sweep_cfg.get("repeats", 1)))
-        estimate_errors = bool(self.sweep_cfg.get("estimate_errors", True))
+        start = float(self.sweep_cfg["start_mhz"])
+        stop = float(self.sweep_cfg["stop_mhz"])
+        if quick:
+            # Same range as the configured sweep (so it checks the resonances
+            # actually of interest), but coarse and unrepeated -- rough
+            # confirmation, not a publishable spectrum.
+            step = max(float(self.sweep_cfg["step_mhz"]), (stop - start) / self._QUICK_TEST_MAX_POINTS)
+            repeats = 1
+            estimate_errors = False
+            frames_per_point = 1
+            discard_frames = 0
+        else:
+            step = float(self.sweep_cfg["step_mhz"])
+            repeats = max(1, int(self.sweep_cfg.get("repeats", 1)))
+            estimate_errors = bool(self.sweep_cfg.get("estimate_errors", True))
+            frames_per_point = self.sweep_cfg["frames_per_point"]
+            discard_frames = int(self.sweep_cfg.get("discard_frames", 1))
+
+        freqs = frequency_axis(start, stop, step)
         probe = self.camera.get_frame()
         cube_mb = estimate_cube_bytes(len(freqs), probe.shape[0], probe.shape[1], self.binning) / 1e6
         # The sum-of-squares accumulator doubles the working set while a
         # repeated sweep with error estimation is running.
         working_mb = cube_mb * (2 if (estimate_errors and repeats > 1) else 1)
+        label = "Quick test" if quick else "Sweeping"
         print(
-            f"Sweeping {len(freqs)} points x {repeats} repeat(s), "
-            f"{self.sweep_cfg['start_mhz']}-{self.sweep_cfg['stop_mhz']} MHz. "
-            f"Datacube ~{cube_mb:.0f} MB (working set ~{working_mb:.0f} MB, "
-            f"binning={self.binning})."
+            f"{label} {len(freqs)} points x {repeats} repeat(s), "
+            f"{start}-{stop} MHz. Datacube ~{cube_mb:.0f} MB "
+            f"(working set ~{working_mb:.0f} MB, binning={self.binning})."
         )
 
         total_points = len(freqs) * repeats
 
         def on_progress(repeat: int, index: int, freq_mhz: float, frame: np.ndarray) -> None:
             done = repeat * len(freqs) + index + 1
-            self._show_image(frame, f"Sweeping... {freq_mhz:.1f} MHz")
+            self._show_image(frame, f"{label}... {freq_mhz:.1f} MHz")
             self._set_status(
-                f"Repeat {repeat + 1}/{repeats} - {freq_mhz:.1f} MHz "
+                f"{label} {repeat + 1}/{repeats} - {freq_mhz:.1f} MHz "
                 f"({done}/{total_points} frames)"
             )
 
@@ -444,8 +481,8 @@ class OdmrApp:
                 freqs,
                 power_dbm=self.mw_cfg["power_dbm"],
                 settle_ms=self.sweep_cfg["settle_ms"],
-                frames_per_point=self.sweep_cfg["frames_per_point"],
-                discard_frames=int(self.sweep_cfg.get("discard_frames", 1)),
+                frames_per_point=frames_per_point,
+                discard_frames=discard_frames,
                 binning=self.binning,
                 repeats=repeats,
                 alternate_direction=bool(self.sweep_cfg.get("alternate_direction", True)),
@@ -460,16 +497,18 @@ class OdmrApp:
                 if result.fully_averaged
                 else f"partial: {int(self.counts.min())}-{int(self.counts.max())} repeats per point"
             )
+            prefix = "Quick test done" if quick else "Sweep done"
+            suffix = " (rough check only, not for export)" if quick else ""
             self._set_status(
-                f"Sweep done: {len(self.frequencies_mhz)} points, {averaging}. "
-                "Click the image to read ODMR."
+                f"{prefix}: {len(self.frequencies_mhz)} points, {averaging}. "
+                f"Click the image to read ODMR.{suffix}"
             )
         except Exception as exc:  # surface hardware errors instead of freezing silently
             print(f"ODMR sweep failed: {exc}")
             self._set_status(f"Sweep failed: {exc}")
         finally:
             self._sweeping = False
-            self.btn_sweep.label.set_text("Run sweep")
+            button.label.set_text("Quick test" if quick else "Run sweep")
             self.fig.canvas.draw_idle()
 
     def _adopt_result(self, result) -> None:
