@@ -74,9 +74,17 @@ def _import_tl_camera_sdk(sdk_source_dir: str | None):
 
     Newer ThorCam releases ship the Python SDK as loose source files (no
     installable package), so ``thorlabs_tsi_sdk`` may simply not exist even
-    with the SDK fully installed. Fall back to adding ``sdk_source_dir``
-    (the SDK's ``Python Toolkit/source`` folder) to ``sys.path`` and
-    importing the ``tl_camera`` module directly in that case.
+    with the SDK fully installed. Fall back to importing ``tl_camera`` out of
+    ``sdk_source_dir`` (the SDK's ``Python Toolkit/source`` folder) in that
+    case.
+
+    ``tl_camera.py`` itself uses relative imports (``from .tl_camera_enums
+    import ...``), since it was written to live inside the ``thorlabs_tsi_sdk``
+    package -- so it cannot be imported as a bare top-level module (that
+    raises "attempted relative import with no known parent package"). Instead,
+    a namespace package is synthesised in ``sys.modules`` with its
+    ``__path__`` pointed at ``sdk_source_dir``, so the relative imports
+    resolve against the other loose files sitting right next to it.
     """
     try:
         from thorlabs_tsi_sdk.tl_camera import TLCameraSDK  # imported lazily
@@ -92,9 +100,15 @@ def _import_tl_camera_sdk(sdk_source_dir: str | None):
                 "at the SDK's 'Python Toolkit/source' folder (contains "
                 "tl_camera.py)."
             )
-        if sdk_source_dir not in sys.path:
-            sys.path.insert(0, sdk_source_dir)
-        import tl_camera  # the newer SDK layout has no package wrapper
+        import importlib
+        import types
+
+        pkg_name = "_thorlabs_tsi_sdk_source"
+        if pkg_name not in sys.modules:
+            pkg = types.ModuleType(pkg_name)
+            pkg.__path__ = [sdk_source_dir]
+            sys.modules[pkg_name] = pkg
+        tl_camera = importlib.import_module(f"{pkg_name}.tl_camera")
 
         return tl_camera.TLCameraSDK
 
