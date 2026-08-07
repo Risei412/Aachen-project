@@ -62,7 +62,19 @@ class ThorlabsCamera:
         if dll_dir:
             _add_dll_directory(dll_dir)
 
-        from thorlabs_tsi_sdk.tl_camera import TLCameraSDK  # imported lazily
+        try:
+            from thorlabs_tsi_sdk.tl_camera import TLCameraSDK  # imported lazily
+        except ModuleNotFoundError as exc:
+            raise ModuleNotFoundError(
+                "thorlabs_tsi_sdk is not installed. Install the Python SDK that "
+                "ships inside the ThorCam installation directory, e.g.:\n"
+                '  pip install "C:/Program Files/Thorlabs/Scientific Imaging/'
+                "Scientific Camera Support/Scientific Camera Interfaces/SDK/"
+                'Python Toolkit/thorlabs_tsi_sdk-*.whl"\n'
+                "(see camera-quick-start-guide-eng.pdf in this folder for the "
+                "exact path shipped with your camera model). Use "
+                "config.yaml's camera.mock: true to run without hardware."
+            ) from exc
 
         self._sdk = TLCameraSDK()
         camera_list = self._sdk.discover_available_cameras()
