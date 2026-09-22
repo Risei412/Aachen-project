@@ -13,6 +13,7 @@ Equipments/CMOS camera/thorlabs_camera.py        camera driver (+ mock)
 Equipments/Microwave generator/synthhd.py        SynthHD driver (+ mock)
 ODMR/odmr_sweep.py                               datacube acquisition + analysis
 ODMR/odmr_app.py                                 GUI
+ODMR/odmr_check.py                               instant "is there ODMR?" verdict on a sweep
 ODMR/config.yaml                                 sweep range, power, exposure, binning, ROI
 ```
 
@@ -54,7 +55,11 @@ and you can probe as many points as you like from one measurement.
    responding, before spending minutes on a full sweep.
 4. Press **"Run sweep"**. Progress is shown as the frequency advances; press
    the same button (now "Abort") to stop early and keep the points measured
-   so far. Sweep parameters are locked while it runs.
+   so far. Sweep parameters are locked while it runs. By default the run
+   starts with a quick coarse **survey**, then measures finely only around
+   the resonances it found, and stops repeating once the data is good
+   enough — see *Faster sweeps* below. The status line reports how long it
+   took and whether it zoomed or stopped early.
 5. When the sweep finishes the image is displayed. **Click anywhere on it**
    to plot that spot's ODMR spectrum in the right-hand panel. The status
    line reports the deepest dip frequency and the contrast. Drag the
@@ -90,11 +95,78 @@ instrument drivers from `../Equipments/`).
 | --- | --- |
 | ODMR: real hardware (camera + SynthHD) | Runs against the Thorlabs camera and COM port in `config.yaml` |
 | ODMR: simulated hardware | Runs with mocks, no instruments needed |
+| ODMR: check newest sweep - is ODMR there? | Verdict + diagnostic plot for the newest `data/*.npz` (see below) |
+| ODMR: check a chosen datacube | Same, for an `.npz` you name |
+| ODMR: watch data/ and check every new sweep | Leave running while measuring; each **"Save raw"** is judged as it lands |
 | ODMR: re-open a saved datacube | Prompts for an `.npz` and opens it for analysis |
 | ODMR: publish results (dry run) | Shows what would be pushed, changes nothing |
 
 The plot window needs a real GUI, so all configurations run in the
 integrated terminal rather than the debug console.
+
+The task **ODMR: check newest sweep (console verdict)** prints the same
+verdict without opening a window. The workspace sets
+`PYTHONIOENCODING=utf-8` for the integrated terminal, because a
+Japanese-locale Windows console (cp932) cannot print some characters the
+scripts use and would otherwise crash mid-output.
+
+## "Is this ODMR?" — instant check of a sweep
+
+`odmr_check.py` answers the first question after every sweep — *is there
+an ODMR signal in this data at all, or should the setup be fixed first?* —
+in a second or two, without clicking anything:
+
+```bash
+python odmr_check.py                    # newest .npz in data/
+python odmr_check.py data/odmr_....npz  # a specific sweep
+python odmr_check.py --watch            # judge every new "Save raw" as it arrives
+python odmr_check.py --no-plot          # console only
+python odmr_check.py --save-plot        # also write <file>_check.png
+```
+
+```
+========================================================================
+  VERDICT: DETECTED
+========================================================================
+  Sweep       : 2800-2940 MHz, 141 points
+  Pixels used : 25104 bright pixels averaged (contrasts below are field averages; ...)
+  Noise floor : 0.0039 % (scatter above baseline)
+  Dips (deepest first):
+   *   2820.0 MHz  contrast  1.515 %  391.8 sigma  (2804-2836 MHz, 33 pts)
+   *   2920.0 MHz  contrast  1.514 %  391.5 sigma  (2904-2936 MHz, 33 pts)
+  Responding  : 12383 px (49.3 % of bright px) at >5 sigma per pixel, peak drop 4.48 %
+========================================================================
+```
+
+The viewer runs the same check automatically when a sweep finishes or a
+file is loaded: the verdict appears in the status line and the full report
+in the terminal.
+
+How it decides:
+
+- Every bright pixel's spectrum is divided by its own mean and the results
+  averaged, so the whole field of view contributes (a dip too shallow for
+  any single ROI still shows) and bright anvil reflections cannot dominate.
+  The contrasts it reports are therefore **field averages** — a single NV
+  spot clicked in the viewer is deeper.
+- Noise is measured from the points *above* the robust baseline — a
+  resonance can only darken the PL, so that side is noise only. With
+  repeats, the larger of this and the between-repeat error is used.
+- **DETECTED**: a dip ≥ 5σ deep spanning ≥ 2 consecutive points
+  (`--sigma`, `--min-points`). **WEAK**: a ≥ 3σ dip that is not
+  conclusive. **NOT DETECTED**: nothing, plus the troubleshooting list.
+  A deep but one-point dip is flagged as a glitch (laser flicker, PLL not
+  locked), not counted as a resonance.
+- It also warns about saturated pixels, a dip touching the end of the
+  sweep, and uneven repeats from an aborted sweep.
+- The plot shows the mean PL, a map of the PL drop on vs. off the dip (where
+  the NV response is), the field-averaged spectrum with the noise band,
+  and the per-pixel drop histogram against its mirror image (the excess on
+  the right is the pixels genuinely responding).
+
+On noise-only simulated data it returned DETECTED in 0 of 300 trials (WEAK
+in 3). Exit status is 0 / 1 / 2 for DETECTED / WEAK / NOT DETECTED and 3 if
+no file was found, so it can be scripted.
 
 ## Publishing results to GitHub
 
@@ -339,7 +411,62 @@ sweep. Binning also raises per-pixel SNR, which matters because a single
 pixel's ODMR contrast is often only a few percent.
 
 Sweep time is roughly
-`n_freq × (settle_ms + frames_per_point × exposure_ms)`.
+`n_freq × repeats × (settle_ms + (discard_frames + frames_per_point) × exposure_ms)`,
+before zoom and early stop (below) cut it down.
+
+## Faster sweeps: zoom and early stop
+
+With the default settings a full sweep is 141 points × 6 repeats ≈ 4.7 min,
+and much of that is spent where nothing happens: most of 2800–2940 MHz is
+flat baseline, and a strong signal is already unmistakable after the first
+pair of repeats. Two features, both on by default in `config.yaml`, remove
+that waste.
+
+**Zoom** (`sweep.zoom`). A quick coarse pass (`survey_step_mhz`, 4 MHz by
+default: 36 points, ~12 s) locates the resonances. The real, repeated sweep
+then measures at the full `step_mhz` only inside a window around each dip,
+and elsewhere only every `baseline_step_mhz` — enough for the baseline fit
+to still see the off-resonance level on both sides. Every point lies on the
+same grid as a full sweep, so results are comparable. If the survey finds
+nothing, the full range is measured exactly as before, so a weak signal the
+survey missed is not lost.
+
+The saving depends on the linewidth: narrow lines leave most of the range
+as sparse baseline; broad lines (strong stress gradients in the cell, or a
+field gradient across the view) need wide windows and save less. The
+window extends to where a dip falls to `depth_fraction` (10 %) of its depth,
+plus `margin_mhz` either side. Raise `margin_mhz` if lineshape wings
+matter for fitting.
+
+The baseline fit weights each point by the frequency span it represents.
+Without that, the densely sampled dip points would outnumber the sparse
+baseline points and pull the fit down; on an evenly spaced sweep the
+weighting changes nothing.
+
+**Early stop** (`sweep.early_stop`). After each repeat the data so far is
+assessed (the same check as `odmr_check.py`), and the sweep ends when
+**both**
+
+- the strongest dip is at least `sigma` (10) noise levels deep in the
+  field average — the resonance is unmistakable — **and**
+- a typical ROI of `roi.half_size_px` has noise at most `roi_noise_pct`
+  (0.2 %) — a spot you click will show a readable spectrum. The field
+  average can be hundreds of sigma clean while single spots are still
+  noisy, so the first condition alone would stop too soon for mapping.
+
+It never stops before `min_repeats` (2), and with `alternate_direction`
+only after an even number of repeats, so drift still cancels over a
+forward/backward pair. `repeats` becomes the upper limit. The terminal
+prints both numbers after each repeat, so you can see how close it is.
+
+Set `roi_noise_pct` lower if you need cleaner single-spot spectra, or
+`enabled: false` to always run every repeat. Stopping on reaching a target
+slightly favours runs whose noise happened to make a dip look deeper, so
+for a careful contrast measurement use fixed repeats; for finding and
+mapping resonances it makes no practical difference.
+
+The **plan line** next to the sweep boxes shows the worst case (all points,
+all repeats, plus the survey). The actual run is usually much shorter.
 
 ## Parameters worth tuning
 
@@ -355,7 +482,11 @@ Sweep time is roughly
 | `roi.half_size_px` | Starting ROI size; adjust live with the slider. Larger averages more pixels — smoother spectrum and tighter error bars (errors add in quadrature) — but blurs spatial detail. |
 | `sweep.start_mhz` / `stop_mhz` / `step_mhz` | Starting sweep range; editable live in the GUI. |
 | `microwave.freq_limits_mhz` | Generator tuning range used to validate GUI entries. SynthHD 54 MHz–13.6 GHz, SynthHD PRO 10 MHz–15 GHz — check your unit. |
-| `sweep.repeats` | Sweeps averaged together. Noise falls as √repeats, time grows linearly. |
+| `sweep.repeats` | Sweeps averaged together. Noise falls as √repeats, time grows linearly. With early stop on, this is the upper limit. |
+| `sweep.early_stop.sigma` / `roi_noise_pct` | When to stop repeating: dip significance in the field average, and noise of a typical ROI. |
+| `sweep.zoom.survey_step_mhz` | Step of the coarse survey that locates the resonances. Keep it at or below the linewidth. |
+| `sweep.zoom.margin_mhz` / `depth_fraction` | How wide the finely sampled window around each dip is. |
+| `sweep.zoom.baseline_step_mhz` | Spacing of the sparse points outside the dips. |
 | `sweep.alternate_direction` | Reverses every 2nd repeat so slow drift cancels instead of tilting the lineshape. |
 | `sweep.estimate_errors` | Error bars from between-repeat scatter. Doubles acquisition memory; no effect at `repeats: 1`. |
 | `sweep.discard_frames` | Frames dropped after each frequency change so no frame straddles two frequencies. |

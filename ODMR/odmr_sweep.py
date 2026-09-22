@@ -55,6 +55,33 @@ def frequency_axis(start_mhz: float, stop_mhz: float, step_mhz: float) -> np.nda
     return start_mhz + step_mhz * np.arange(n_points)
 
 
+def zoomed_axis(
+    start_mhz: float,
+    stop_mhz: float,
+    step_mhz: float,
+    windows: list[tuple[float, float]],
+    baseline_step_mhz: float,
+) -> np.ndarray:
+    """Fine points inside ``windows``, sparse points everywhere else.
+
+    Most of an NV sweep is flat baseline: finely sampling it costs as much
+    time as the resonances but only pins down one straight line. This keeps
+    the full ``step_mhz`` resolution inside each ``(low, high)`` window
+    around a resonance, and elsewhere only every ``baseline_step_mhz`` --
+    enough for the robust baseline fit to still see the off-resonance level
+    on both sides. All points lie on the same grid as the full sweep, so
+    the result is directly comparable with an unzoomed measurement.
+    """
+    full = frequency_axis(start_mhz, stop_mhz, step_mhz)
+    stride = max(1, int(round(baseline_step_mhz / step_mhz)))
+    keep = np.zeros(len(full), dtype=bool)
+    keep[::stride] = True
+    keep[-1] = True  # always anchor the baseline at both ends
+    for low, high in windows:
+        keep |= (full >= low - 1e-9) & (full <= high + 1e-9)
+    return full[keep]
+
+
 def bin_frame(frame: np.ndarray, binning: int) -> np.ndarray:
     """Average ``binning`` x ``binning`` pixel blocks together.
 
@@ -105,6 +132,7 @@ def acquire_odmr_cube(
     estimate_errors: bool = True,
     on_progress=None,
     should_abort=None,
+    after_repeat=None,
 ) -> OdmrResult:
     """Sweep the microwave, storing a full camera frame per frequency point.
 
@@ -133,6 +161,11 @@ def acquire_odmr_cube(
     the old and the new microwave frequency -- especially when the exposure
     is longer than ``settle_ms`` -- so keeping it mixes adjacent frequency
     points together and adds a comb-like structure to the noise floor.
+
+    ``after_repeat(repeats_completed, result_so_far)`` is called after each
+    full repeat with the average so far; returning True ends the
+    measurement there. That lets the caller stop as soon as the signal is
+    good enough instead of always running every repeat.
 
     ``on_progress(repeat, index, freq_mhz, frame)`` is called after each
     frequency point. ``should_abort()`` is polled between points; returning
@@ -187,9 +220,23 @@ def acquire_odmr_cube(
             if aborted:
                 break
             repeats_completed += 1
+            if (
+                after_repeat is not None
+                and repeat < repeats - 1
+                and after_repeat(
+                    repeats_completed,
+                    _assemble(frequencies_mhz, sums, sums_sq, counts, repeats_completed),
+                )
+            ):
+                break
     finally:
         generator.enable_rf(False)
 
+    return _assemble(frequencies_mhz, sums, sums_sq, counts, repeats_completed)
+
+
+def _assemble(frequencies_mhz, sums, sums_sq, counts, repeats_completed) -> OdmrResult:
+    """Average the accumulators into a result, dropping unmeasured points."""
     measured = counts > 0
     if not np.any(measured):
         raise RuntimeError("Sweep aborted before any frequency point was measured")
@@ -390,6 +437,87 @@ def roi_spectrum_error(sem: np.ndarray | None, roi: Roi) -> np.ndarray | None:
     if n_pixels == 0:
         return None
     return np.sqrt(np.nansum(patch ** 2, axis=(1, 2))) / n_pixels
+
+
+def robust_baseline(
+    frequencies_mhz: np.ndarray,
+    spectrum: np.ndarray,
+    reject_sigma: float = 2.5,
+    iterations: int = 8,
+) -> np.ndarray:
+    """Off-resonance baseline a spectrum should be normalised against.
+
+    Dividing by the single brightest point (the obvious choice) is
+    fragile: one upward noise spike then defines 100 %, pushing the
+    whole curve down and inflating the apparent contrast. It also
+    leaves any linear baseline tilt from slow drift in the lineshape.
+
+    So fit a straight line instead -- but fit it *robustly*. Fitting
+    the two ends of the sweep only works if the resonances happen to
+    sit in the middle; with the default 2800-2940 MHz range and NV
+    resonances near 2820/2920 the dips fall inside the end windows,
+    drag the fit down, and the contrast comes out badly under-reported.
+
+    Instead fit all points and iteratively reject those lying well
+    *below* the fit. Rejection is one-sided because an ODMR resonance
+    can only darken the photoluminescence: downward outliers are
+    signal, upward ones are noise. The scale is set by the median
+    absolute deviation, which the dips cannot inflate as long as they
+    occupy a minority of the sweep. The fit therefore converges onto
+    the off-resonance baseline wherever the resonances happen to lie.
+
+    Each point is weighted by the frequency span it stands for (half the
+    gap to each neighbour). On an evenly spaced sweep that changes
+    nothing; on a zoomed sweep (:func:`zoomed_axis`), where the resonances
+    are sampled finely and the baseline sparsely, it stops the densely
+    packed dip points from outvoting the baseline -- by point count the
+    dips are then the majority, by frequency span they are not.
+
+    Falls back to the spectrum's maximum when there are too few points
+    to fit or the fit comes out non-positive.
+    """
+    spectrum = np.asarray(spectrum, dtype=float)
+    n = len(spectrum)
+    fallback = np.full(n, float(np.max(spectrum)))
+    if n < 5:
+        return fallback
+
+    x = np.asarray(frequencies_mhz, dtype=float)
+    span = np.abs(np.gradient(x)) if n > 1 else np.ones(n)
+    weight = span / span.mean() if span.mean() > 0 else np.ones(n)
+    mask = np.ones(n, dtype=bool)
+    baseline = fallback
+    for _ in range(iterations):
+        if mask.sum() < 4 or weight[mask].sum() < 0.2 * weight.sum():
+            break  # too little of the sweep left to trust the fit
+        try:
+            # polyfit weights multiply the residuals, hence the square root.
+            coefficients = np.polyfit(x[mask], spectrum[mask], 1, w=np.sqrt(weight[mask]))
+        except (np.linalg.LinAlgError, ValueError):
+            return fallback
+        baseline = np.polyval(coefficients, x)
+
+        residual = spectrum - baseline
+        centre = _weighted_median(residual, weight)
+        spread = 1.4826 * _weighted_median(np.abs(residual - centre), weight)
+        if spread <= 0:
+            break
+        keep = residual > -reject_sigma * spread
+        if np.array_equal(keep, mask):
+            break
+        mask = keep
+
+    if not np.all(np.isfinite(baseline)) or np.any(baseline <= 0):
+        return fallback
+    return baseline
+
+
+def _weighted_median(values: np.ndarray, weights: np.ndarray) -> float:
+    if np.allclose(weights, weights[0]):
+        return float(np.median(values))  # evenly spaced sweep: the plain median
+    order = np.argsort(values)
+    cumulative = np.cumsum(weights[order])
+    return float(values[order][np.searchsorted(cumulative, 0.5 * cumulative[-1])])
 
 
 def normalize_spectrum(spectrum: np.ndarray, reference: str = "max") -> np.ndarray:

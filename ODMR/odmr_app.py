@@ -32,6 +32,7 @@ import argparse
 import os
 import sys
 import threading
+import time
 from datetime import datetime
 
 import numpy as np
@@ -54,12 +55,15 @@ from odmr_sweep import (  # noqa: E402
     load_cube,
     mw_on_off_check,
     normalize_spectrum,
+    robust_baseline,
     roi_spectrum,
     roi_spectrum_error,
     save_cube,
     summarize_difference,
+    zoomed_axis,
 )
 from export_results import export_measurement  # noqa: E402
+from odmr_check import assess_result, resonance_windows  # noqa: E402
 from thorlabs_camera import MockThorlabsCamera, ThorlabsCamera  # noqa: E402
 from synthhd import MockSynthHD, SynthHD  # noqa: E402
 
@@ -109,6 +113,8 @@ class OdmrApp:
         self._view_mode = "pl"
         self._sweeping = False
         self._abort = False
+        self._alternating = bool(self.sweep_cfg.get("alternate_direction", True))
+        self._early_stop_note = ""
         self.roi_patch = None
 
         self.camera = self.generator = None
@@ -328,8 +334,27 @@ class OdmrApp:
             if self.sweep_cfg.get("estimate_errors", True) and repeats > 1:
                 megabytes *= 2  # sum-of-squares accumulator runs alongside the sum
 
-        duration = f"{seconds:.0f} s" if seconds < 120 else f"{seconds / 60:.1f} min"
-        text = f"→ {n_points} points × {repeats} = {n_points * repeats} frames, ~{duration}"
+        zoom = self._zoom_cfg()
+        survey_seconds = 0.0
+        if zoom["enabled"]:
+            n_survey = int(round((stop - start) / zoom["survey_step_mhz"])) + 1
+            survey_seconds = (
+                n_survey * zoom["survey_repeats"]
+                * (settle + (frames + discarded) * self.exposure_ms) / 1000.0
+            )
+        seconds += survey_seconds
+
+        def fmt(t: float) -> str:
+            return f"{t:.0f} s" if t < 120 else f"{t / 60:.1f} min"
+
+        if zoom["enabled"] or self._early_stop_cfg()["enabled"]:
+            # Zoom and early stop only ever shorten the run; how much is
+            # known only once data comes in, so show the worst case.
+            text = f"→ ≤{n_points} points × ≤{repeats}, at most ~{fmt(seconds)}"
+            if zoom["enabled"]:
+                text += f" (incl. {fmt(survey_seconds)} survey)"
+        else:
+            text = f"→ {n_points} points × {repeats} = {n_points * repeats} frames, ~{fmt(seconds)}"
         if megabytes:
             text += f", ~{megabytes:.0f} MB"
         self.plan_text.set_text(text)
@@ -404,53 +429,157 @@ class OdmrApp:
             return
         threading.Thread(target=self._run_sweep, daemon=True).start()
 
+    def _zoom_cfg(self) -> dict:
+        cfg = self.sweep_cfg.get("zoom") or {}
+        return {
+            "enabled": bool(cfg.get("enabled", False)),
+            "survey_step_mhz": float(cfg.get("survey_step_mhz", 4.0)),
+            "survey_repeats": max(1, int(cfg.get("survey_repeats", 1))),
+            "margin_mhz": float(cfg.get("margin_mhz", 8.0)),
+            "depth_fraction": float(cfg.get("depth_fraction", 0.1)),
+            "baseline_step_mhz": float(cfg.get("baseline_step_mhz", 5.0)),
+        }
+
+    def _early_stop_cfg(self) -> dict:
+        cfg = self.sweep_cfg.get("early_stop") or {}
+        roi_noise = cfg.get("roi_noise_pct", 0.2)
+        return {
+            "enabled": bool(cfg.get("enabled", False)),
+            "sigma": float(cfg.get("sigma", 10.0)),
+            "roi_noise_pct": None if roi_noise is None else float(roi_noise),
+            "min_repeats": max(1, int(cfg.get("min_repeats", 2))),
+        }
+
+    def _progress_callback(self, label: str, n_freq: int, repeats: int):
+        total = n_freq * repeats
+        counter = {"done": 0}
+
+        def on_progress(repeat: int, index: int, freq_mhz: float, frame: np.ndarray) -> None:
+            counter["done"] += 1
+            self._show_image(frame, f"{label}... {freq_mhz:.1f} MHz")
+            self._set_status(
+                f"{label}: repeat {repeat + 1}/{repeats} - {freq_mhz:.1f} MHz "
+                f"({counter['done']}/{total} frames)"
+            )
+
+        return on_progress
+
+    def _should_stop_early(self, completed: int, result) -> bool:
+        """Stop repeating once both the resonance and a single ROI are clean enough.
+
+        Two conditions, because they answer different questions. The
+        field-averaged dip significance says the resonance is unmistakably
+        there; the typical ROI noise says a spot clicked in the viewer will
+        show a readable spectrum -- the field average can be hundreds of
+        sigma clean long before any one ROI is.
+        """
+        cfg = self._early_stop_cfg()
+        if completed < cfg["min_repeats"]:
+            return False
+        # With alternating direction a drift only cancels over a forward +
+        # backward pair; stopping after an odd repeat would leave it in.
+        if self._alternating and completed % 2:
+            return False
+        a = assess_result(
+            result, self.config.get("analysis", {}), roi_half_size=self.roi_half_size
+        )
+        best = a.significant[0] if a.significant else None
+        roi_ok = cfg["roi_noise_pct"] is None or (
+            a.roi_noise_pct is not None and a.roi_noise_pct <= cfg["roi_noise_pct"]
+        )
+        roi_text = "n/a" if a.roi_noise_pct is None else f"{a.roi_noise_pct:.3f} %"
+        print(
+            f"After {completed} repeat(s): best dip "
+            f"{best.significance if best else 0.0:.1f} sigma (target {cfg['sigma']:g}), "
+            f"ROI noise {roi_text} (target {cfg['roi_noise_pct']})"
+        )
+        if best is not None and best.significance >= cfg["sigma"] and roi_ok:
+            self._early_stop_note = (
+                f" Stopped early: {best.significance:.0f} sigma, ROI noise {roi_text}."
+            )
+            return True
+        return False
+
     def _run_sweep(self) -> None:
         self._sweeping = True
         self._abort = False
+        self._early_stop_note = ""
         self.btn_sweep.label.set_text("Abort")
+        started = time.monotonic()
 
-        freqs = frequency_axis(
-            self.sweep_cfg["start_mhz"], self.sweep_cfg["stop_mhz"], self.sweep_cfg["step_mhz"]
-        )
+        start = float(self.sweep_cfg["start_mhz"])
+        stop = float(self.sweep_cfg["stop_mhz"])
+        step = float(self.sweep_cfg["step_mhz"])
         repeats = max(1, int(self.sweep_cfg.get("repeats", 1)))
         estimate_errors = bool(self.sweep_cfg.get("estimate_errors", True))
-        probe = self.camera.get_frame()
-        cube_mb = estimate_cube_bytes(len(freqs), probe.shape[0], probe.shape[1], self.binning) / 1e6
-        # The sum-of-squares accumulator doubles the working set while a
-        # repeated sweep with error estimation is running.
-        working_mb = cube_mb * (2 if (estimate_errors and repeats > 1) else 1)
-        print(
-            f"Sweeping {len(freqs)} points x {repeats} repeat(s), "
-            f"{self.sweep_cfg['start_mhz']}-{self.sweep_cfg['stop_mhz']} MHz. "
-            f"Datacube ~{cube_mb:.0f} MB (working set ~{working_mb:.0f} MB, "
-            f"binning={self.binning})."
+        self._alternating = bool(self.sweep_cfg.get("alternate_direction", True))
+        common = dict(
+            power_dbm=self.mw_cfg["power_dbm"],
+            settle_ms=self.sweep_cfg["settle_ms"],
+            frames_per_point=self.sweep_cfg["frames_per_point"],
+            discard_frames=int(self.sweep_cfg.get("discard_frames", 1)),
+            binning=self.binning,
+            alternate_direction=self._alternating,
+            should_abort=lambda: self._abort,
         )
 
-        total_points = len(freqs) * repeats
+        try:
+            freqs = frequency_axis(start, stop, step)
+            n_full = len(freqs)
+            zoom_note = ""
+            zoom = self._zoom_cfg()
+            if zoom["enabled"]:
+                # A quick coarse pass finds where the resonances are, so the
+                # fine, repeated sweep can skip most of the flat baseline.
+                survey_freqs = frequency_axis(start, stop, zoom["survey_step_mhz"])
+                survey = acquire_odmr_cube(
+                    self.camera, self.generator, survey_freqs,
+                    repeats=zoom["survey_repeats"], estimate_errors=False,
+                    on_progress=self._progress_callback(
+                        "Survey", len(survey_freqs), zoom["survey_repeats"]
+                    ),
+                    **common,
+                )
+                if self._abort:
+                    self._adopt_result(survey)
+                    self._set_status("Aborted during the survey; showing the coarse survey.")
+                    return
+                windows = resonance_windows(
+                    assess_result(survey, self.config.get("analysis", {})),
+                    zoom["depth_fraction"],
+                    zoom["margin_mhz"],
+                )
+                if windows:
+                    freqs = zoomed_axis(start, stop, step, windows, zoom["baseline_step_mhz"])
+                    spans = ", ".join(
+                        f"{max(lo, start):g}-{min(hi, stop):g}" for lo, hi in windows
+                    )
+                    zoom_note = f" Zoomed on {spans} MHz: {len(freqs)} of {n_full} points."
+                else:
+                    zoom_note = " Survey found no resonance, so the full range was measured."
+                print(zoom_note.strip())
 
-        def on_progress(repeat: int, index: int, freq_mhz: float, frame: np.ndarray) -> None:
-            done = repeat * len(freqs) + index + 1
-            self._show_image(frame, f"Sweeping... {freq_mhz:.1f} MHz")
-            self._set_status(
-                f"Repeat {repeat + 1}/{repeats} - {freq_mhz:.1f} MHz "
-                f"({done}/{total_points} frames)"
+            probe = self.camera.get_frame()
+            cube_mb = estimate_cube_bytes(len(freqs), probe.shape[0], probe.shape[1], self.binning) / 1e6
+            # The sum-of-squares accumulator doubles the working set while a
+            # repeated sweep with error estimation is running.
+            working_mb = cube_mb * (2 if (estimate_errors and repeats > 1) else 1)
+            print(
+                f"Sweeping {len(freqs)} points x up to {repeats} repeat(s), "
+                f"{start:g}-{stop:g} MHz. "
+                f"Datacube ~{cube_mb:.0f} MB (working set ~{working_mb:.0f} MB, "
+                f"binning={self.binning})."
             )
 
-        try:
             result = acquire_odmr_cube(
                 self.camera,
                 self.generator,
                 freqs,
-                power_dbm=self.mw_cfg["power_dbm"],
-                settle_ms=self.sweep_cfg["settle_ms"],
-                frames_per_point=self.sweep_cfg["frames_per_point"],
-                discard_frames=int(self.sweep_cfg.get("discard_frames", 1)),
-                binning=self.binning,
                 repeats=repeats,
-                alternate_direction=bool(self.sweep_cfg.get("alternate_direction", True)),
                 estimate_errors=estimate_errors,
-                on_progress=on_progress,
-                should_abort=lambda: self._abort,
+                on_progress=self._progress_callback("Sweep", len(freqs), repeats),
+                after_repeat=self._should_stop_early if self._early_stop_cfg()["enabled"] else None,
+                **common,
             )
             self._adopt_result(result)
 
@@ -459,9 +588,12 @@ class OdmrApp:
                 if result.fully_averaged
                 else f"partial: {int(self.counts.min())}-{int(self.counts.max())} repeats per point"
             )
+            elapsed = time.monotonic() - started
+            print(f"Sweep finished in {elapsed:.0f} s.")
             self._set_status(
-                f"Sweep done: {len(self.frequencies_mhz)} points, {averaging}. "
-                "Click the image to read ODMR."
+                f"Sweep done in {elapsed:.0f} s: {len(self.frequencies_mhz)} points, {averaging}."
+                f"{zoom_note}{self._early_stop_note} "
+                f"{self._assess(result)} Click the image to read ODMR."
             )
         except Exception as exc:  # surface hardware errors instead of freezing silently
             print(f"ODMR sweep failed: {exc}")
@@ -481,6 +613,18 @@ class OdmrApp:
         self._contrast = contrast_map(self.cube, self.min_signal_fraction)
         self._view_mode = "pl"
         self._refresh_image_view()
+
+    def _assess(self, result) -> str:
+        """Judge at once whether the sweep saw ODMR; full report to the terminal."""
+        try:
+            assessment = assess_result(
+                result, self.config.get("analysis", {}), roi_half_size=self.roi_half_size
+            )
+        except Exception as exc:  # the verdict is a convenience; never lose the sweep over it
+            print(f"ODMR check failed: {exc}")
+            return ""
+        print(assessment.report())
+        return assessment.headline() + "."
 
     # -------------------------------------------------- MW on/off diagnostic check
 
@@ -646,54 +790,14 @@ class OdmrApp:
     def _spectrum_baseline(self, raw: np.ndarray) -> np.ndarray:
         """Off-resonance baseline the spectrum is normalised against.
 
-        Dividing by the single brightest point (the obvious choice) is
-        fragile: one upward noise spike then defines 100 %, pushing the
-        whole curve down and inflating the apparent contrast. It also
-        leaves any linear baseline tilt from slow drift in the lineshape.
-
-        So fit a straight line instead -- but fit it *robustly*. Fitting
-        the two ends of the sweep only works if the resonances happen to
-        sit in the middle; with the default 2800-2940 MHz range and NV
-        resonances near 2820/2920 the dips fall inside the end windows,
-        drag the fit down, and the contrast comes out badly under-reported.
-
-        Instead fit all points and iteratively reject those lying well
-        *below* the fit. Rejection is one-sided because an ODMR resonance
-        can only darken the photoluminescence: downward outliers are
-        signal, upward ones are noise. The scale is set by the median
-        absolute deviation, which the dips cannot inflate as long as they
-        occupy a minority of the sweep. The fit therefore converges onto
-        the off-resonance baseline wherever the resonances happen to lie.
+        See :func:`odmr_sweep.robust_baseline` for why this is a one-sided
+        robust line fit rather than division by the brightest point.
         """
-        n = len(raw)
-        fallback = np.full(n, float(np.max(raw)))
-        if not self.baseline_correction or n < 5:
-            return fallback
-
-        x = np.asarray(self.frequencies_mhz, dtype=float)
-        mask = np.ones(n, dtype=bool)
-        baseline = fallback
-        for _ in range(self.baseline_iterations):
-            if mask.sum() < max(4, int(0.2 * n)):
-                break  # too few points left to trust the fit
-            try:
-                coefficients = np.polyfit(x[mask], raw[mask], 1)
-            except (np.linalg.LinAlgError, ValueError):
-                return fallback
-            baseline = np.polyval(coefficients, x)
-
-            residual = raw - baseline
-            spread = 1.4826 * float(np.median(np.abs(residual - np.median(residual))))
-            if spread <= 0:
-                break
-            keep = residual > -self.baseline_reject_sigma * spread
-            if np.array_equal(keep, mask):
-                break
-            mask = keep
-
-        if not np.all(np.isfinite(baseline)) or np.any(baseline <= 0):
-            return fallback
-        return baseline
+        if not self.baseline_correction:
+            return np.full(len(raw), float(np.max(raw)))
+        return robust_baseline(
+            self.frequencies_mhz, raw, self.baseline_reject_sigma, self.baseline_iterations
+        )
 
     def _plot_spectrum(self, roi: Roi) -> None:
         raw = roi_spectrum(self.cube, roi)
@@ -821,7 +925,7 @@ class OdmrApp:
         result, metadata = load_cube(path)
         self.binning = int(metadata.get("binning", self.binning))
         self._adopt_result(result)
-        self._set_status(f"Loaded {path} — click the image to read ODMR.")
+        self._set_status(f"Loaded {path}. {self._assess(result)} Click the image to read ODMR.")
         print(
             f"Loaded {path}: {self.cube.shape[0]} frequency points, "
             f"{result.repeats_completed} repeat(s), metadata={metadata}"

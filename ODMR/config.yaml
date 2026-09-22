@@ -52,6 +52,24 @@ sweep:
   estimate_errors: true   # also accumulate sum-of-squares so the spectrum gets error
                           # bars from the scatter between repeats. Doubles the memory
                           # used while acquiring. No effect when repeats is 1.
+  early_stop:             # stop repeating as soon as the data is good enough,
+                          # instead of always running all `repeats`
+    enabled: true
+    sigma: 10.0           # field-averaged dip must be at least this many noise levels deep
+    roi_noise_pct: 0.2    # AND a typical ROI (roi.half_size_px) must be this quiet, so a
+                          # clicked spot shows a readable spectrum. null = ignore this test.
+    min_repeats: 2        # never stop before this many repeats. With alternate_direction
+                          # the stop also waits for an even count (forward+backward pairs).
+  zoom:                   # measure the flat baseline sparsely, the resonances finely
+    enabled: true
+    survey_step_mhz: 4.0  # a quick coarse pass over start..stop at this step finds the dips
+    survey_repeats: 1
+    margin_mhz: 8.0       # extra fine range each side of a dip found by the survey
+    depth_fraction: 0.1   # a dip's window ends where it is shallower than this fraction
+                          # of its own depth
+    baseline_step_mhz: 5.0   # spacing of the points kept outside the dips, so the
+                          # baseline fit still sees both sides. If the survey finds no
+                          # dip, the full range is measured at step_mhz as before.
 
 roi:
   half_size_px: 15      # clicked point +/- this many (binned) pixels is averaged
